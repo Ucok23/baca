@@ -1,0 +1,14 @@
+[package]
+name = "baca"
+version = "0.1.0"
+edition = "2021"
+description = "A quiet native Markdown reader"
+license = "MIT"
+
+[dependencies]
+# Kept at the same deliberately pinned revision as Rekam's native client so
+# the two desktop apps have a compatible, reproducible UI foundation.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1c3d902fbf1cbd513f5d989d96a8c18694e4c287" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1c3d902fbf1cbd513f5d989d96a8c18694e4c287", features = ["wayland", "x11"] }
+pulldown-cmark = "0.12"
+
