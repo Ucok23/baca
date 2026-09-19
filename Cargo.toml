@@ -12,3 +12,7 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "1c3d902fbf1cbd513
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1c3d902fbf1cbd513f5d989d96a8c18694e4c287", features = ["wayland", "x11"] }
 pulldown-cmark = "0.12"
 
+# Pure-Rust regex engine (`fancy`) rather than the default oniguruma, so the
+# build stays free of a C dependency.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+
