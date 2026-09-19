@@ -7,15 +7,25 @@ reading surface.
 ## Run
 
 ```bash
+cargo run                         # open the gallery
 cargo run -- path/to/notes.md     # open one document
-cargo run -- path/to/folder       # open a library
+cargo run -- path/to/folder       # add a folder and open it
 ```
 
-Passing a file opens that document and treats its folder as the library.
-Passing nothing opens an empty shelf; press `Ctrl+O` to choose a folder.
+baca opens on its gallery: what you were last reading, what you have read
+lately, and the collections it knows about. Picking up where you left off is
+one click, at the place you left it.
 
-Launched with no arguments, baca reopens whatever you were last reading, at
-the place you left it.
+## Collections
+
+A collection is any folder that holds Markdown. baca looks in `Documents`,
+`Notes`, `Obsidian`, `vault` and `wiki` under your home folder, plus any
+folder you add with `Ctrl+O` or name on the command line. It does not sweep
+your whole home directory: on a developer's machine that is mostly source
+trees rather than anything to read.
+
+Nesting is kept, so a vault with `journal/` and `refs/` appears as three
+collections — that is how its author filed things.
 
 ## Controls
 
@@ -30,8 +40,8 @@ the place you left it.
 | `Ctrl` `+` `-` `0` | text size |
 | `Ctrl+A` / `Ctrl+C` | select all, copy the selection |
 | `j` `k` `space` `g` `G` | move through the page |
-| `↑` `↓` `Enter` | move through the shelf, open |
-| `Esc` / `Alt+Left` | back to the shelf |
+| `↑` `↓` `Enter` | move through the gallery or shelf, open |
+| `Esc` / `Alt+Left` | back one screen |
 
 Drag across the page to select text. Click a link to follow it: external URLs
 open in the browser, and relative or `[[wiki]]` links open in place. Click an

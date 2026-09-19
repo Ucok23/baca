@@ -52,6 +52,24 @@ from a launch with no arguments.
 - [x] **YAML frontmatter** — parsed as metadata. Supplies the title, shows its
       tags in the sidebar, and stays out of the body and the shelf preview.
 
+## Reading experience
+
+- [x] **A home gallery** — baca opens on what you were reading, what you read
+      lately, and the collections it found, rather than dropping you straight
+      into a document.
+- [x] **Recent reads** — the last thirty documents, with their collection, how
+      far through you got, and when.
+- [x] **Collection discovery** — the usual note folders under `$HOME`, plus any
+      you add. Nesting is kept; noise directories are never walked.
+- [x] **Onboarding** — an empty gallery says where baca looked and offers to
+      be pointed somewhere else.
+- [x] **The sidebar follows the page** — it keyed off whether a document had
+      ever been opened rather than what is on screen, so stepping back to a
+      collection left the previous document's outline sitting there. Clicking
+      the wordmark now returns to the gallery from anywhere.
+- [ ] **Pinned collections** — keep the ones you use at the top.
+- [ ] **Per-collection sort** — by title, by date, by how recently read.
+
 ## P2 — Differentiators
 
 - [ ] **Math** — LaTeX / KaTeX-style rendering.
@@ -89,6 +107,8 @@ from a launch with no arguments.
       min-content size, which for a run of text is the whole line, so the item
       could not shrink and the text ran off the page. Visible only once the
       column hit its maximum width, which is why a narrow window looked fine.
+- [x] A file changing on disk called `read()`, which forces the reading view,
+      so an edit while you were on a shelf yanked you into the document.
 - [ ] The document is still not virtualized: every block is laid out each
       frame, whether or not it is on screen.
 - [ ] `scan()` holds each file's whole text in memory to make the library

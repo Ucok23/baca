@@ -1,14 +1,16 @@
 mod highlight;
+mod library;
 mod markdown;
 mod settings;
 mod theme;
 mod watch;
 use gpui::{
-    actions, div, img, point, prelude::*, px, size, App, AppContext, Bounds, ClipboardItem, Entity,
-    FontStyle, FontWeight, HighlightStyle, InteractiveText, KeyBinding, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Render,
-    ScrollHandle, SharedString, SharedUri, StatefulInteractiveElement, StrikethroughStyle,
-    StyledText, Subscription, TextLayout, UnderlineStyle, WindowBounds, WindowOptions,
+    actions, div, img, point, prelude::*, px, relative, size, App, AppContext, Bounds,
+    ClipboardItem, Entity, FontStyle, FontWeight, HighlightStyle, InteractiveText, KeyBinding,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
+    Pixels, Point, Render, ScrollHandle, SharedString, SharedUri, StatefulInteractiveElement,
+    StrikethroughStyle, StyledText, Subscription, TextLayout, UnderlineStyle, WindowBounds,
+    WindowOptions,
 };
 use markdown::{Block, Marker};
 use pulldown_cmark::{Alignment, HeadingLevel};
@@ -209,6 +211,24 @@ fn scan(root: &Path) -> Vec<Entry> {
     o
 }
 
+/// Which screen baca is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// The gallery: what you were reading, what you read lately, what you have.
+    Home,
+    /// One collection's documents.
+    Shelf,
+    /// A document.
+    Reading,
+}
+
+/// Something on the home screen the keyboard can land on.
+#[derive(Clone)]
+enum HomeItem {
+    Document(PathBuf),
+    Collection(PathBuf),
+}
+
 /// One laid-out run of document text. Pieces are registered in document order
 /// as the page renders, which is what lets a selection run across blocks.
 struct Piece {
@@ -300,6 +320,8 @@ struct Baca {
     outline: bool,
     /// Which library entry the keyboard is on.
     cursor: usize,
+    view: View,
+    collections: Vec<library::Collection>,
     settings: Settings,
     watch: Option<watch::Watch>,
     _subscriptions: Vec<Subscription>,
@@ -330,16 +352,16 @@ impl Baca {
             scale: settings.scale,
             outline: settings.outline,
             cursor: 0,
+            view: View::Home,
+            collections: Vec::new(),
             watch: watch::Watch::new(),
             settings,
             _subscriptions: Vec::new(),
         };
         baca.rescan(cx);
+        baca.discover(cx);
         baca.observe_files(cx);
         baca.autosave(cx);
-        if let Some(path) = baca.settings.open.clone() {
-            baca.read(path, cx);
-        }
         baca
     }
 
@@ -355,8 +377,110 @@ impl Baca {
             let path = path.clone();
             self.settings
                 .remember_position(&path, f32::from(self.scroll.offset().y));
+            let progress = self.progress();
+            self.settings.update_progress(&path, progress);
         }
         self.settings.save();
+    }
+
+    /// Find the folders worth reading, off the main thread.
+    fn discover(&mut self, cx: &mut gpui::Context<Self>) {
+        // Only the standard note folders and the ones the reader added.
+        // `root` is merely the collection currently open — folding it in here
+        // would make the set of collections shift as you browse.
+        let mut roots = library::default_roots();
+        roots.extend(self.settings.folders.iter().cloned());
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_spawn(async move { library::discover(&roots) })
+                .await;
+            this.update(cx, |state, cx| {
+                state.collections = found;
+                cx.notify()
+            })
+        })
+        .detach();
+    }
+
+    /// How far through the open document the reader has come.
+    fn progress(&self) -> f32 {
+        let max = f32::from(self.scroll.max_offset().y);
+        if max <= 1. {
+            // Nothing to scroll: the whole thing is on screen, so it is read.
+            return 1.;
+        }
+        (f32::from(self.scroll.offset().y).abs() / max).clamp(0., 1.)
+    }
+
+    /// Everything the keyboard can land on at home, in the order shown.
+    fn home_items(&self) -> Vec<HomeItem> {
+        let needle = self.query.to_lowercase();
+        let mut items: Vec<HomeItem> = self
+            .settings
+            .recent_reads()
+            .into_iter()
+            .filter(|r| {
+                needle.is_empty()
+                    || r.title.to_lowercase().contains(&needle)
+                    || r.collection.to_lowercase().contains(&needle)
+            })
+            .map(|r| HomeItem::Document(r.path.clone()))
+            .collect();
+        items.extend(
+            self.collections
+                .iter()
+                .filter(|c| needle.is_empty() || c.name.to_lowercase().contains(&needle))
+                .map(|c| HomeItem::Collection(c.path.clone())),
+        );
+        items
+    }
+
+    fn open_collection(&mut self, path: PathBuf, cx: &mut gpui::Context<Self>) {
+        self.root = Some(path);
+        self.view = View::Shelf;
+        // Each screen starts at its own top; only a document resumes where it
+        // was left, and that is restored when it is read.
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        self.query.clear();
+        self.typing = false;
+        self.cursor = 0;
+        self.entries.clear();
+        self.rescan(cx);
+        self.retarget_watch();
+        self.remember();
+        cx.notify()
+    }
+
+    /// Straight back to the gallery, from wherever you are.
+    fn go_home(&mut self, cx: &mut gpui::Context<Self>) {
+        self.remember();
+        self.view = View::Home;
+        self.open = None;
+        self.doc = Default::default();
+        self.query.clear();
+        self.typing = false;
+        self.cursor = 0;
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify()
+    }
+
+    /// Step back one screen: a document returns to its collection, a
+    /// collection returns to the gallery.
+    fn go_back(&mut self, cx: &mut gpui::Context<Self>) {
+        self.query.clear();
+        self.typing = false;
+        self.cursor = 0;
+        self.view = match self.view {
+            View::Reading if self.root.is_some() => View::Shelf,
+            _ => View::Home,
+        };
+        if self.view == View::Home {
+            self.open = None;
+            self.doc = Default::default();
+        }
+        self.remember();
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify()
     }
 
     /// Walk the library off the main thread: a large vault reads thousands of
@@ -422,7 +546,9 @@ impl Baca {
                     return true;
                 }
                 if let Some(open) = state.open.clone() {
-                    if watch::touches(&changed, &open) {
+                    // Only while it is actually on screen: an edit should not
+                    // yank the reader out of the shelf and into the document.
+                    if state.view == View::Reading && watch::touches(&changed, &open) {
                         // Keep the reading position: an edit elsewhere in the
                         // file should not throw the reader back to the top.
                         let offset = state.scroll.offset();
@@ -458,8 +584,13 @@ impl Baca {
 
     fn reload(&mut self, cx: &mut gpui::Context<Self>) {
         self.rescan(cx);
+        self.discover(cx);
         // Re-read whatever is on screen too, so Ctrl+R does the obvious thing
         // while reading rather than only refreshing the shelf.
+        if self.view != View::Reading {
+            cx.notify();
+            return;
+        }
         if let Some(path) = self.open.clone() {
             let offset = self.scroll.offset();
             self.read(path, cx);
@@ -481,6 +612,22 @@ impl Baca {
             .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
             .unwrap_or_default();
         let resumed = self.settings.position(&path);
+        let collection = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // Carry any progress forward: re-reading a document, or reloading it
+        // after an edit on disk, must not reset how far through it you were.
+        let progress = self
+            .settings
+            .recent
+            .iter()
+            .find(|r| r.path == path)
+            .map_or(0., |r| r.progress);
+        self.settings
+            .remember_read(&path, &self.title, &collection, progress);
+        self.view = View::Reading;
         self.open = Some(path);
         self.anchor = None;
         self.head = None;
@@ -715,9 +862,12 @@ impl Baca {
         found
     }
 
-    /// Move the keyboard through the shelf.
+    /// Move the keyboard through whichever list is showing.
     fn step_entry(&mut self, forward: bool, cx: &mut gpui::Context<Self>) {
-        let count = self.visible().len();
+        let count = match self.view {
+            View::Home => self.home_items().len(),
+            _ => self.visible().len(),
+        };
         if count == 0 {
             return;
         }
@@ -728,7 +878,20 @@ impl Baca {
         cx.notify()
     }
 
+    /// Activate whatever the keyboard is on.
     fn open_focused(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.view == View::Home {
+            match self.home_items().get(self.cursor).cloned() {
+                Some(HomeItem::Document(path)) => {
+                    self.typing = false;
+                    self.query.clear();
+                    self.read(path, cx)
+                }
+                Some(HomeItem::Collection(path)) => self.open_collection(path, cx),
+                None => {}
+            }
+            return;
+        }
         let Some(&ix) = self.visible().get(self.cursor) else {
             return;
         };
@@ -1237,10 +1400,13 @@ impl Baca {
                 .and_then(|x| x.and_then(|mut x| x.pop()));
             let _ = this.update(cx, |s, cx| {
                 if let Some(p) = p {
-                    s.root = Some(p);
+                    if !s.settings.folders.contains(&p) {
+                        s.settings.folders.push(p.clone());
+                    }
                     s.open = None;
                     s.doc = Default::default();
-                    s.reload(cx)
+                    s.discover(cx);
+                    s.open_collection(p, cx);
                 }
             });
         })
@@ -1250,7 +1416,11 @@ impl Baca {
 
 impl Baca {
     /// The sidebar: the outline of the open document, or the library's home.
+    /// The sidebar, which always describes whatever the page is showing: a
+    /// document's outline while reading, the collection while on its shelf.
     fn sidebar(&self, p: &Palette, cx: &mut gpui::Context<Self>) -> gpui::AnyElement {
+        let reading = self.view == View::Reading;
+        let outline = reading && self.outline && !self.doc.outline.is_empty();
         let mut panel = div()
             .w(px(260.))
             .flex_none()
@@ -1266,9 +1436,12 @@ impl Baca {
                     .pt_6()
                     .child(
                         div()
+                            .id("wordmark")
+                            .cursor_pointer()
                             .font_family(theme::display())
                             .text_size(self.at(size_of::H3))
                             .text_color(p.text)
+                            .on_click(cx.listener(|state, _, _, cx| state.go_home(cx)))
                             .child("baca"),
                     )
                     .child(
@@ -1277,16 +1450,11 @@ impl Baca {
                             .text_size(self.at(size_of::LABEL))
                             .text_color(p.text_faint)
                             .mt_1()
-                            .child(if self.open.is_some() && self.outline {
-                                "CONTENTS"
-                            } else {
-                                "MARKDOWN LIBRARY"
-                            }),
+                            .child(if outline { "CONTENTS" } else { "COLLECTION" }),
                     ),
             );
 
-        let showing_outline = self.open.is_some() && self.outline && !self.doc.outline.is_empty();
-        if showing_outline {
+        if outline {
             let smallest = self
                 .doc
                 .outline
@@ -1324,6 +1492,21 @@ impl Baca {
                         )),
                 );
         } else {
+            // On a shelf, or in a document with no headings: say which
+            // collection this is and how much is in it.
+            let name = self
+                .root
+                .as_ref()
+                .and_then(|r| r.file_name())
+                .map(|n| n.to_string_lossy().into_owned());
+            let note = if reading {
+                "No headings — Ctrl+B".to_string()
+            } else {
+                match self.entries.len() {
+                    1 => "1 document".to_string(),
+                    n => format!("{n} documents"),
+                }
+            };
             panel = panel.child(
                 div()
                     .flex_1()
@@ -1331,30 +1514,38 @@ impl Baca {
                     .pt_8()
                     .child(
                         div()
+                            .font_family(theme::display())
+                            .text_size(self.at(size_of::H4))
+                            .text_color(p.text)
+                            .child(name.unwrap_or_else(|| "No folder".into())),
+                    )
+                    .child(
+                        div()
+                            .font_family(theme::mono())
+                            .text_size(self.at(size_of::LABEL))
+                            .text_color(p.text_faint)
+                            .mt_1()
+                            .child(note),
+                    )
+                    .child(
+                        div()
                             .font_family(theme::body())
                             .text_size(self.at(size_of::SMALL))
                             .text_color(p.text_muted)
+                            .mt_6()
                             .child(
                                 self.root
                                     .as_ref()
                                     .map(|x| x.display().to_string())
                                     .unwrap_or_else(|| "Choose a folder — Ctrl+O".into()),
                             ),
-                    )
-                    .children(self.open.is_some().then(|| {
-                        div()
-                            .font_family(theme::mono())
-                            .text_size(self.at(size_of::LABEL))
-                            .text_color(p.text_faint)
-                            .mt_4()
-                            .child("No headings — Ctrl+B")
-                    })),
+                    ),
             );
         }
 
-        // Tags from the front matter say what a note is filed under.
+        // Front-matter tags belong to the open document, not to the shelf.
         let tags = self.doc.meta.tags();
-        if self.open.is_some() && !tags.is_empty() {
+        if reading && !tags.is_empty() {
             panel = panel.child(
                 div()
                     .px_6()
@@ -1391,7 +1582,9 @@ impl Baca {
         };
         if self.typing || !self.query.is_empty() {
             let hits = self.hits.borrow().len();
-            let tally = if self.open.is_none() {
+            let tally = if self.view == View::Home {
+                format!("{} found", self.home_items().len())
+            } else if self.view == View::Shelf {
                 format!("{} of {} notes", self.visible().len(), self.entries.len())
             } else if hits == 0 {
                 "no matches".to_string()
@@ -1430,6 +1623,20 @@ impl Baca {
                 )
                 .into_any_element();
         }
+        // Where you are, and the way back out of it.
+        let back = match self.view {
+            View::Home => None,
+            View::Shelf => Some("←  All collections".to_string()),
+            View::Reading => Some(match &self.root {
+                Some(root) => format!(
+                    "←  {}",
+                    root.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Back".into())
+                ),
+                None => "←  Home".to_string(),
+            }),
+        };
         div()
             .h(px(76.))
             .flex()
@@ -1438,13 +1645,20 @@ impl Baca {
             .gap_6()
             .border_b_1()
             .border_color(p.border)
-            .child(
-                div()
+            .child(match back {
+                Some(text) => div()
+                    .id("back")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|state, _, _, cx| state.go_back(cx)))
+                    .child(label(text))
+                    .into_any_element(),
+                None => div()
                     .id("choose")
                     .cursor_pointer()
                     .on_click(cx.listener(|state, _, _, cx| state.choose(cx)))
-                    .child(label("Choose folder  Ctrl+O".into())),
-            )
+                    .child(label("Choose folder  Ctrl+O".into()))
+                    .into_any_element(),
+            })
             .child(label("Find  Ctrl+F".into()))
             .child(
                 div()
@@ -1454,6 +1668,270 @@ impl Baca {
                     .child(label(format!("{}  Ctrl+T", self.theme.label()))),
             )
             .into_any_element()
+    }
+
+    /// A small caption line: collection, progress, and when it was read.
+    fn caption(&self, p: &Palette, parts: Vec<String>) -> gpui::AnyElement {
+        div()
+            .font_family(theme::mono())
+            .text_size(self.at(size_of::LABEL))
+            .text_color(p.text_faint)
+            .mt_1()
+            .child(parts.join("  ·  "))
+            .into_any_element()
+    }
+
+    /// A thin bar showing how far through a document the reader got.
+    fn progress_bar(&self, p: &Palette, progress: f32) -> gpui::AnyElement {
+        div()
+            .mt_3()
+            .h(px(3.))
+            .w_full()
+            .bg(p.border)
+            .child(
+                div()
+                    .h_full()
+                    .w(relative(progress.clamp(0.02, 1.)))
+                    .bg(p.accent),
+            )
+            .into_any_element()
+    }
+
+    /// The gallery: where you left off, what you read lately, what you have.
+    fn home(&self, p: &Palette, cx: &mut gpui::Context<Self>) -> gpui::AnyElement {
+        let heading = |text: &str| {
+            div()
+                .font_family(theme::mono())
+                .text_size(self.at(size_of::LABEL))
+                .text_color(p.text_faint)
+                .mt_10()
+                .mb_4()
+                .child(text.to_string())
+        };
+        let recent = self.home_items();
+        let documents: Vec<PathBuf> = recent
+            .iter()
+            .filter_map(|i| match i {
+                HomeItem::Document(path) => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        let collections: Vec<PathBuf> = recent
+            .iter()
+            .filter_map(|i| match i {
+                HomeItem::Collection(path) => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let mut page = div()
+            .pt_10()
+            .child(
+                div()
+                    .font_family(theme::display())
+                    .text_size(self.at(size_of::TITLE * 1.4))
+                    .text_color(p.text)
+                    .child("baca"),
+            )
+            .child(
+                div()
+                    .font_family(theme::body())
+                    .text_size(self.at(size_of::BODY))
+                    .text_color(p.text_muted)
+                    .mt_1()
+                    .child("A quiet Markdown reader."),
+            );
+
+        // Nothing found and nothing added: say where baca looked, and how to
+        // point it somewhere else.
+        if documents.is_empty() && collections.is_empty() && self.query.is_empty() {
+            return page
+                .child(heading("NOTHING HERE YET"))
+                .child(
+                    div()
+                        .font_family(theme::body())
+                        .text_size(self.at(size_of::BODY))
+                        .line_height(self.at(size_of::BODY_LINE))
+                        .text_color(p.text_muted)
+                        .max_w(px(520.))
+                        .child(
+                            "baca looks for Markdown in Documents, Notes, Obsidian, \
+                             vault and wiki under your home folder. Point it at a \
+                             folder of your own and it will remember.",
+                        ),
+                )
+                .child(
+                    div()
+                        .id("onboard-choose")
+                        .cursor_pointer()
+                        .mt_6()
+                        .px_4()
+                        .py_3()
+                        .bg(p.bg_subtle)
+                        .border_1()
+                        .border_color(p.border_mid)
+                        .w(px(220.))
+                        .font_family(theme::mono())
+                        .text_size(self.at(size_of::SMALL))
+                        .text_color(p.accent)
+                        .hover(|this| this.bg(p.bg_raised))
+                        .on_click(cx.listener(|state, _, _, cx| state.choose(cx)))
+                        .child("Choose a folder  Ctrl+O"),
+                )
+                .into_any_element();
+        }
+
+        // The first recent document gets a card of its own: picking up where
+        // you left off is the commonest reason to open a reader.
+        let mut row = 0;
+        if let Some(path) = documents.first().cloned() {
+            if let Some(entry) = self.settings.recent.iter().find(|r| r.path == path) {
+                let focused = self.cursor == row;
+                let open = path.clone();
+                page = page.child(heading("CONTINUE READING")).child(
+                    div()
+                        .id("continue")
+                        .cursor_pointer()
+                        .p_5()
+                        .bg(if focused { p.bg_raised } else { p.bg_subtle })
+                        .border_1()
+                        .border_color(if focused { p.accent } else { p.border })
+                        .hover(|this| this.bg(p.bg_raised))
+                        .on_click(cx.listener(move |state, _, _, cx| state.read(open.clone(), cx)))
+                        .child(
+                            div()
+                                .font_family(theme::display())
+                                .text_size(self.at(size_of::H2))
+                                .text_color(p.text)
+                                .child(entry.title.clone()),
+                        )
+                        .child(self.caption(
+                            p,
+                            vec![
+                                entry.collection.clone(),
+                                format!("{}%", (entry.progress * 100.).round() as u32),
+                                settings::ago(entry.at),
+                            ],
+                        ))
+                        .child(self.progress_bar(p, entry.progress)),
+                );
+                row += 1;
+            }
+        }
+
+        if documents.len() > 1 {
+            page =
+                page.child(heading("RECENTLY READ")).children(
+                    documents
+                        .iter()
+                        .skip(1)
+                        .filter_map(|path| {
+                            let entry = self.settings.recent.iter().find(|r| &r.path == path)?;
+                            let ix = row;
+                            row += 1;
+                            let focused = self.cursor == ix;
+                            let open = path.clone();
+                            Some(
+                                div()
+                                    .id(("recent", ix))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_baseline()
+                                    .justify_between()
+                                    .gap_4()
+                                    .py_3()
+                                    .px_3()
+                                    .border_t_1()
+                                    .border_color(p.border)
+                                    .when(focused, |this| this.bg(p.bg_subtle))
+                                    .hover(|this| this.bg(p.bg_subtle))
+                                    .on_click(cx.listener(move |state, _, _, cx| {
+                                        state.read(open.clone(), cx)
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .font_family(theme::body())
+                                            .text_size(self.at(size_of::H5))
+                                            .text_color(p.text)
+                                            .child(entry.title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .font_family(theme::mono())
+                                            .text_size(self.at(size_of::LABEL))
+                                            .text_color(p.text_faint)
+                                            .child(format!(
+                                                "{}  ·  {}",
+                                                entry.collection,
+                                                settings::ago(entry.at)
+                                            )),
+                                    ),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+        }
+
+        page = page.child(heading("COLLECTIONS")).child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_3()
+                .children(collections.iter().filter_map(|path| {
+                    let found = self.collections.iter().find(|c| &c.path == path)?;
+                    let ix = row;
+                    row += 1;
+                    let focused = self.cursor == ix;
+                    let open = path.clone();
+                    Some(
+                        div()
+                            .id(("collection", ix))
+                            .cursor_pointer()
+                            .w(px(200.))
+                            .p_4()
+                            .bg(if focused { p.bg_raised } else { p.bg_subtle })
+                            .border_1()
+                            .border_color(if focused { p.accent } else { p.border })
+                            .hover(|this| this.bg(p.bg_raised))
+                            .on_click(cx.listener(move |state, _, _, cx| {
+                                state.open_collection(open.clone(), cx)
+                            }))
+                            .child(
+                                div()
+                                    .font_family(theme::display())
+                                    .text_size(self.at(size_of::H4))
+                                    .text_color(p.text)
+                                    .child(found.name.clone()),
+                            )
+                            .child(self.caption(
+                                p,
+                                vec![match found.count {
+                                    1 => "1 document".to_string(),
+                                    n => format!("{n} documents"),
+                                }],
+                            )),
+                    )
+                }))
+                .child(
+                    div()
+                        .id("add-folder")
+                        .cursor_pointer()
+                        .w(px(200.))
+                        .p_4()
+                        .border_1()
+                        .border_color(p.border_mid)
+                        .font_family(theme::mono())
+                        .text_size(self.at(size_of::SMALL))
+                        .text_color(p.accent)
+                        .hover(|this| this.bg(p.bg_subtle))
+                        .on_click(cx.listener(|state, _, _, cx| state.choose(cx)))
+                        .child("+  Add a folder"),
+                ),
+        );
+        page.into_any_element()
     }
 
     /// The shelf of documents, filtered by the current query.
@@ -1546,7 +2024,7 @@ impl Render for Baca {
         self.heading_pieces.borrow_mut().clear();
         self.hits.borrow_mut().clear();
 
-        let reading = self.open.is_some();
+        let reading = self.view == View::Reading;
         let body = if reading {
             div()
                 .pt_10()
@@ -1567,8 +2045,10 @@ impl Render for Baca {
                         .map(|(i, b)| self.block(b, &p, i, &this)),
                 )
                 .into_any_element()
-        } else {
+        } else if self.view == View::Shelf {
             self.shelf(&p, cx)
+        } else {
+            self.home(&p, cx)
         };
         let header = self.header(&p, cx);
         div()
@@ -1582,35 +2062,28 @@ impl Render for Baca {
             .on_action(cx.listener(|s, _: &ChooseFolder, _, cx| s.choose(cx)))
             .on_action(cx.listener(|s, _: &Reload, _, cx| s.reload(cx)))
             .on_action(cx.listener(|s, _: &CycleTheme, _, cx| s.cycle_theme(cx)))
-            .on_action(cx.listener(|s, _: &Library, _, cx| {
-                s.open = None;
-                s.query.clear();
-                s.typing = false;
-                s.cursor = 0;
-                s.remember();
-                cx.notify()
-            }))
+            .on_action(cx.listener(|s, _: &Library, _, cx| s.go_back(cx)))
             .on_action(cx.listener(|s, _: &CopySelection, _, cx| s.copy_selection(cx)))
             .on_action(cx.listener(|s, _: &SelectAll, _, cx| s.select_all(cx)))
             .on_action(cx.listener(|s, _: &StartSearch, _, cx| s.start_search(cx)))
             .on_action(cx.listener(|s, _: &CancelSearch, _, cx| s.cancel_search(cx)))
             .on_action(cx.listener(|s, _: &AcceptSearch, _, cx| {
                 s.typing = false;
-                // In the shelf, committing a search opens what it found.
-                if s.open.is_none() {
+                // In a list, committing a search opens what it found.
+                if s.view != View::Reading {
                     s.open_focused(cx);
                 }
                 cx.notify()
             }))
             .on_action(cx.listener(|s, _: &FindNext, _, cx| {
-                if s.open.is_some() {
+                if s.view == View::Reading {
                     s.step_hit(true, cx)
                 } else {
                     s.step_entry(true, cx)
                 }
             }))
             .on_action(cx.listener(|s, _: &FindPrev, _, cx| {
-                if s.open.is_some() {
+                if s.view == View::Reading {
                     s.step_hit(false, cx)
                 } else {
                     s.step_entry(false, cx)
@@ -1650,7 +2123,7 @@ impl Render for Baca {
             }))
             // In the shelf the arrows walk the list; in a document they scroll.
             .on_action(cx.listener(|s, _: &NextEntry, _, cx| {
-                if s.open.is_some() {
+                if s.view == View::Reading {
                     let step = s.at(size_of::BODY_LINE) * 3.;
                     s.scroll_by(step, cx)
                 } else {
@@ -1658,7 +2131,7 @@ impl Render for Baca {
                 }
             }))
             .on_action(cx.listener(|s, _: &PrevEntry, _, cx| {
-                if s.open.is_some() {
+                if s.view == View::Reading {
                     let step = s.at(size_of::BODY_LINE) * 3.;
                     s.scroll_by(-step, cx)
                 } else {
@@ -1666,74 +2139,80 @@ impl Render for Baca {
                 }
             }))
             .on_action(cx.listener(|s, _: &OpenEntry, _, cx| {
-                if s.open.is_none() {
+                if s.view != View::Reading {
                     s.open_focused(cx)
                 }
             }))
             .child(
-                div().h_full().flex().child(self.sidebar(&p, cx)).child(
-                    div()
-                        .flex_1()
-                        // Without this the page's own width wins and squeezes
-                        // the sidebar instead of scrolling.
-                        .min_w_0()
-                        .h_full()
-                        .flex()
-                        .flex_col()
-                        // The header stays put: a search tally is no use
-                        // if stepping through matches scrolls it away.
-                        .child(
-                            div()
-                                .w_full()
-                                .flex_none()
-                                .flex()
-                                .justify_center()
-                                .child(div().w_full().max_w(COLUMN).px_10().child(header)),
-                        )
-                        .child(
-                            div()
-                                .id("scroll")
-                                .flex_1()
-                                .min_h_0()
-                                // Vertical only: prose that scrolls sideways
-                                // has simply failed to wrap.
-                                .overflow_y_scroll()
-                                .track_scroll(&self.scroll)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|s, e: &MouseDownEvent, _, cx| {
-                                        s.anchor = s.cursor_at(e.position);
-                                        s.head = s.anchor;
-                                        s.dragging = s.anchor.is_some();
-                                        cx.notify()
-                                    }),
-                                )
-                                .on_mouse_move(cx.listener(|s, e: &MouseMoveEvent, _, cx| {
-                                    if s.dragging {
-                                        s.head = s.cursor_at(e.position);
-                                        cx.notify()
-                                    }
-                                }))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|s, _: &MouseUpEvent, _, cx| {
-                                        s.dragging = false;
-                                        cx.notify()
-                                    }),
-                                )
-                                .child(
-                                    div().w_full().flex().justify_center().child(
-                                        div()
-                                            .w_full()
-                                            .max_w(COLUMN)
-                                            .px_10()
-                                            .pb_16()
-                                            .pt_2()
-                                            .child(body),
+                div()
+                    .h_full()
+                    .flex()
+                    // The gallery is its own full-width screen; a sidebar
+                    // listing one document's headings has nothing to say there.
+                    .children((self.view != View::Home).then(|| self.sidebar(&p, cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            // Without this the page's own width wins and squeezes
+                            // the sidebar instead of scrolling.
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            // The header stays put: a search tally is no use
+                            // if stepping through matches scrolls it away.
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex_none()
+                                    .flex()
+                                    .justify_center()
+                                    .child(div().w_full().max_w(COLUMN).px_10().child(header)),
+                            )
+                            .child(
+                                div()
+                                    .id("scroll")
+                                    .flex_1()
+                                    .min_h_0()
+                                    // Vertical only: prose that scrolls sideways
+                                    // has simply failed to wrap.
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|s, e: &MouseDownEvent, _, cx| {
+                                            s.anchor = s.cursor_at(e.position);
+                                            s.head = s.anchor;
+                                            s.dragging = s.anchor.is_some();
+                                            cx.notify()
+                                        }),
+                                    )
+                                    .on_mouse_move(cx.listener(|s, e: &MouseMoveEvent, _, cx| {
+                                        if s.dragging {
+                                            s.head = s.cursor_at(e.position);
+                                            cx.notify()
+                                        }
+                                    }))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|s, _: &MouseUpEvent, _, cx| {
+                                            s.dragging = false;
+                                            cx.notify()
+                                        }),
+                                    )
+                                    .child(
+                                        div().w_full().flex().justify_center().child(
+                                            div()
+                                                .w_full()
+                                                .max_w(COLUMN)
+                                                .px_10()
+                                                .pb_16()
+                                                .pt_2()
+                                                .child(body),
+                                        ),
                                     ),
-                                ),
-                        ),
-                ),
+                            ),
+                    ),
             )
     }
 }
@@ -1747,9 +2226,13 @@ fn main() {
         .filter(|p| p.is_dir())
         .or_else(|| file.as_ref().and_then(|f| f.parent().map(PathBuf::from)));
     let mut settings = Settings::load();
-    // An argument on the command line wins over the remembered library.
-    if root.is_some() {
-        settings.root = root;
+    // A folder named on the command line is as deliberate as choosing one in
+    // the app, so it joins the gallery rather than applying just this once.
+    if let Some(root) = root {
+        if !settings.folders.contains(&root) {
+            settings.folders.push(root.clone());
+        }
+        settings.root = Some(root);
     }
     gpui_platform::application().run(move |cx: &mut App| {
         theme::load_fonts(cx);
