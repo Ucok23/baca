@@ -33,17 +33,24 @@ app.
 
 ## P1 — Reader-grade
 
-- [ ] **Outline / table of contents panel** — `Document::outline` is already
+All done. Verified in the running app: search, keyboard navigation, zoom,
+front matter, auto-reload on an external edit, and a full session restored
+from a launch with no arguments.
+
+- [x] **Outline / table of contents panel** — `Document::outline` is already
       populated and never rendered.
-- [ ] **Search** — in-document find, and full-text search across the library.
-- [ ] **Keyboard navigation** — `j`/`k`, space, `g`/`G`, arrows in the library.
-- [ ] **Persistence** — root folder, theme, last file, and scroll position
-      survive a restart.
-- [ ] **File watching** — auto-reload when the file changes on disk.
-- [ ] **Text size control** — `Ctrl` `+` / `-` / `0`.
-- [ ] **Follow the system colour scheme** — Kraft and Malleable are already
+- [x] **Search** — `Ctrl+F`. In a document it finds and steps through matches
+      (`n` / `N`); on the shelf it filters the library by title, path and body.
+- [x] **Keyboard navigation** — `j`/`k`, space, `g`/`G`, arrows in the library.
+- [x] **Persistence** — root folder, theme, last file, zoom, outline state and
+      reading position survive a restart. Written on change, every few seconds
+      while reading, and on quit.
+- [x] **File watching** — auto-reload when the file changes on disk.
+- [x] **Text size control** — `Ctrl` `+` / `-` / `0`.
+- [x] **Follow the system colour scheme** — Kraft and Malleable are already
       dark; nothing picks between them and Paper automatically.
-- [ ] **YAML frontmatter** — parsed as metadata, not rendered as a stray block.
+- [x] **YAML frontmatter** — parsed as metadata. Supplies the title, shows its
+      tags in the sidebar, and stays out of the body and the shelf preview.
 
 ## P2 — Differentiators
 
@@ -70,9 +77,19 @@ app.
       stopped rendering. The font is now resolved against what is installed.
 - [x] The derived document title was rendered above the document's own opening
       heading, showing the title twice.
-- [ ] `scan()` reads every `.md` file in full, on the main thread, just to take
-      a two-line preview.
-- [ ] `render()` clones the whole `entries` vector every frame, and there is no
-      list virtualization.
-- [ ] `Ctrl+R` returns to the top of the document instead of holding the
+- [x] `scan()` read every `.md` file in full on the main thread. It now runs on
+      a background thread, and the text it reads is kept for full-text search
+      rather than thrown away.
+- [x] `render()` cloned the whole `entries` vector every frame. Filtering now
+      yields indices instead.
+- [x] `Ctrl+R` returned to the top of the document instead of holding the
       reading position.
+- [x] List items, table cells and footnote bodies never wrapped: each is a
+      flex row whose text child took its automatic minimum width from its
+      min-content size, which for a run of text is the whole line, so the item
+      could not shrink and the text ran off the page. Visible only once the
+      column hit its maximum width, which is why a narrow window looked fine.
+- [ ] The document is still not virtualized: every block is laid out each
+      frame, whether or not it is on screen.
+- [ ] `scan()` holds each file's whole text in memory to make the library
+      searchable. Fine for a normal vault, wasteful for a huge one.

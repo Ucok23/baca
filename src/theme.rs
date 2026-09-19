@@ -37,11 +37,7 @@ static FONTS: OnceLock<Fonts> = OnceLock::new();
 fn pick(stack: &[&str], installed: &[String]) -> SharedString {
     stack
         .iter()
-        .find(|want| {
-            installed
-                .iter()
-                .any(|have| have.eq_ignore_ascii_case(want))
-        })
+        .find(|want| installed.iter().any(|have| have.eq_ignore_ascii_case(want)))
         .map(|name| SharedString::from(name.to_string()))
         // Nothing matched: let the platform pick, rather than naming a family
         // that is certainly absent.
@@ -87,11 +83,13 @@ pub struct Palette {
     pub text_muted: Rgba,
     pub text_faint: Rgba,
     pub accent: Rgba,
-    pub accent_text: Rgba,
     pub border: Rgba,
     pub border_mid: Rgba,
     pub code: Rgba,
     pub selection: Rgba,
+    /// Behind every search match, and behind the one being stepped through.
+    pub match_any: Rgba,
+    pub match_now: Rgba,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -102,6 +100,22 @@ pub enum Theme {
 }
 
 impl Theme {
+    /// Every theme, in the order `Ctrl+T` cycles through them.
+    pub const ALL: [Theme; 3] = [Theme::Paper, Theme::Kraft, Theme::Malleable];
+
+    pub fn from_label(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.label() == name)
+    }
+
+    /// The theme to use for a given desktop preference.
+    pub fn for_system(dark: bool) -> Self {
+        if dark {
+            Self::Malleable
+        } else {
+            Self::Paper
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Paper => "Paper",
@@ -137,11 +151,12 @@ impl Theme {
                 text_muted: rgb(0x5e574b),
                 text_faint: rgb(0x9a9183),
                 accent: rgb(0x2e4a78),
-                accent_text: rgb(0xfbf8f1),
                 border: rgb(0xe4ddce),
                 border_mid: rgb(0xd6ccb8),
                 code: rgb(0xeee8dc),
                 selection: rgb(0xd8ddea),
+                match_any: rgb(0xe8dcb0),
+                match_now: rgb(0xf0c979),
             },
             Self::Kraft => Palette {
                 bg: rgb(0x1c1a15),
@@ -151,11 +166,12 @@ impl Theme {
                 text_muted: rgb(0xa39b85),
                 text_faint: rgb(0x6f6858),
                 accent: rgb(0x7fa0d9),
-                accent_text: rgb(0x12182a),
                 border: rgb(0x332e24),
                 border_mid: rgb(0x423b2e),
                 code: rgb(0x211e17),
                 selection: rgb(0x3a3e52),
+                match_any: rgb(0x4a4228),
+                match_now: rgb(0x7a6420),
             },
             Self::Malleable => Palette {
                 bg: rgb(0x0a0c0f),
@@ -165,11 +181,12 @@ impl Theme {
                 text_muted: rgb(0x9aa1a8),
                 text_faint: rgb(0x676b6f),
                 accent: rgb(0x7fd4e0),
-                accent_text: rgb(0x0a0c0f),
                 border: rgb(0x1c1f24),
                 border_mid: rgb(0x2a2f36),
                 code: rgb(0x111419),
                 selection: rgb(0x23383d),
+                match_any: rgb(0x2b3a46),
+                match_now: rgb(0x3f6070),
             },
         }
     }

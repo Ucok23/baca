@@ -6,11 +6,15 @@ description = "A quiet native Markdown reader"
 license = "MIT"
 
 [dependencies]
+dirs = "7.0.0"
 # Kept at the same deliberately pinned revision as Rekam's native client so
 # the two desktop apps have a compatible, reproducible UI foundation.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1c3d902fbf1cbd513f5d989d96a8c18694e4c287" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1c3d902fbf1cbd513f5d989d96a8c18694e4c287", features = ["wayland", "x11"] }
+notify = "8.2.0"
 pulldown-cmark = "0.12"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 # Pure-Rust regex engine (`fancy`) rather than the default oniguruma, so the
 # build stays free of a C dependency.

@@ -1,26 +1,80 @@
 mod highlight;
 mod markdown;
+mod settings;
 mod theme;
+mod watch;
 use gpui::{
-    actions, div, img, prelude::*, px, size, App, Bounds, ClipboardItem, Entity, FontStyle,
-    FontWeight, HighlightStyle, InteractiveText, KeyBinding, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
-    SharedString, SharedUri, StatefulInteractiveElement, StrikethroughStyle, StyledText,
-    TextLayout,
-    UnderlineStyle, WindowBounds, WindowOptions,
+    actions, div, img, point, prelude::*, px, size, App, AppContext, Bounds, ClipboardItem, Entity,
+    FontStyle, FontWeight, HighlightStyle, InteractiveText, KeyBinding, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Render,
+    ScrollHandle, SharedString, SharedUri, StatefulInteractiveElement, StrikethroughStyle,
+    StyledText, Subscription, TextLayout, UnderlineStyle, WindowBounds, WindowOptions,
 };
 use markdown::{Block, Marker};
 use pulldown_cmark::{Alignment, HeadingLevel};
+use settings::Settings;
 use std::cell::RefCell;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 use theme::{Palette, Theme};
 
 actions!(
     baca,
-    [ChooseFolder, Reload, CycleTheme, Library, CopySelection, SelectAll]
+    [
+        ChooseFolder,
+        Reload,
+        CycleTheme,
+        Library,
+        CopySelection,
+        SelectAll,
+        StartSearch,
+        CancelSearch,
+        AcceptSearch,
+        FindNext,
+        FindPrev,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        LineDown,
+        LineUp,
+        PageDown,
+        PageUp,
+        GoTop,
+        GoBottom,
+        ToggleOutline,
+        NextEntry,
+        PrevEntry,
+        OpenEntry,
+    ]
 );
+
+/// The measure: how wide a column of prose is allowed to get, however wide
+/// the window is.
+const COLUMN: Pixels = px(900.);
+
+/// How often the watcher's channel is drained.
+const WATCH_INTERVAL: Duration = Duration::from_millis(400);
+
+/// How often the reading position is written out while reading.
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Base type sizes, in pixels before the reader's zoom is applied.
+mod size_of {
+    pub const TITLE: f32 = 30.;
+    pub const H1: f32 = 30.;
+    pub const H2: f32 = 24.;
+    pub const H3: f32 = 20.;
+    pub const H4: f32 = 18.;
+    pub const H5: f32 = 16.;
+    pub const BODY: f32 = 18.;
+    pub const BODY_LINE: f32 = 29.;
+    pub const SMALL: f32 = 14.;
+    pub const CODE: f32 = 14.;
+    pub const CODE_LINE: f32 = 21.;
+    pub const LABEL: f32 = 12.;
+}
 
 const MARKDOWN_EXTENSIONS: [&str; 3] = ["md", "markdown", "mdx"];
 
@@ -35,6 +89,94 @@ struct Entry {
     path: PathBuf,
     title: String,
     preview: String,
+    /// Title, path and body folded to lower case, so filtering the library is
+    /// a plain substring test rather than a fresh read of every file.
+    haystack: String,
+}
+
+impl Entry {
+    fn matches(&self, needle: &str) -> bool {
+        needle.is_empty() || self.haystack.contains(needle)
+    }
+}
+
+/// Reduce inline markup to the words it wraps, so a shelf preview reads as
+/// prose rather than as source. Notes often open with a banner image.
+fn strip_markup(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find(['[', '!', '*', '`', '_']) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        // `![alt](url)` and `[text](url)` both keep only the part in brackets.
+        let link = rest.strip_prefix("![").or_else(|| rest.strip_prefix('['));
+        if let Some(inner) = link {
+            if let Some((text, tail)) = inner.split_once(']') {
+                let tail = match tail.strip_prefix('(') {
+                    Some(after) => after.split_once(')').map_or(tail, |(_, t)| t),
+                    None => tail,
+                };
+                out.push_str(text);
+                rest = tail;
+                continue;
+            }
+        }
+        let mut chars = rest.chars();
+        let first = chars.next();
+        if !matches!(first, Some('*' | '`' | '_')) {
+            if let Some(c) = first {
+                out.push(c);
+            }
+        }
+        rest = chars.as_str();
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// Split leading front matter off a document, as (metadata, body). A file
+/// that merely opens with a horizontal rule is left alone.
+fn split_front_matter(source: &str) -> (&str, &str) {
+    let Some(rest) = source
+        .strip_prefix("---\n")
+        .or_else(|| source.strip_prefix("---\r\n"))
+    else {
+        return ("", source);
+    };
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if matches!(line.trim_end(), "---" | "...") {
+            return (&rest[..offset], &rest[offset + line.len()..]);
+        }
+        offset += line.len();
+    }
+    // No closing fence: treat the whole file as body rather than swallow it.
+    ("", source)
+}
+
+/// A shelf entry's title and one line of preview, taken cheaply from the raw
+/// text. Front matter is metadata, not the opening of the note.
+fn summarize(body: &str, filename: &str) -> (String, String) {
+    let (meta, rest) = split_front_matter(body);
+    let tidy = |line: &str| strip_markup(line.trim_start_matches('#').trim());
+    let mut lines = rest.lines().filter(|l| !l.trim().is_empty()).map(tidy);
+    let titled = meta
+        .lines()
+        .find_map(|l| l.strip_prefix("title:"))
+        .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+        .filter(|t| !t.is_empty());
+    let (title, preview) = match titled {
+        // Front matter named the note, so its first body line is still preview.
+        Some(title) => (title, lines.next()),
+        None => (
+            lines.next().unwrap_or_else(|| filename.to_string()),
+            lines.next(),
+        ),
+    };
+    (
+        title,
+        preview.unwrap_or_else(|| "No preview available.".to_string()),
+    )
 }
 
 fn scan(root: &Path) -> Vec<Entry> {
@@ -49,15 +191,14 @@ fn scan(root: &Path) -> Vec<Entry> {
             if p.is_dir() {
                 walk(&p, o)
             } else if is_markdown(&p) {
-                let s = std::fs::read_to_string(&p).unwrap_or_default();
-                let mut l = s.lines().filter(|x| !x.trim().is_empty());
+                let body = std::fs::read_to_string(&p).unwrap_or_default();
+                let (title, preview) = summarize(&body, &n);
+                let haystack = format!("{title}\n{}\n{body}", p.to_string_lossy()).to_lowercase();
                 o.push(Entry {
                     path: p,
-                    title: l.next().unwrap_or(&n).trim_start_matches('#').trim().into(),
-                    preview: l
-                        .next()
-                        .unwrap_or("No preview available.")
-                        .replace(['#', '*', '`'], ""),
+                    title,
+                    preview,
+                    haystack,
                 })
             }
         }
@@ -73,6 +214,13 @@ fn scan(root: &Path) -> Vec<Entry> {
 struct Piece {
     text: String,
     layout: TextLayout,
+}
+
+/// One occurrence of the search query, as found while rendering. Only the
+/// piece is needed to scroll to it; the range is painted as it is found.
+#[derive(Clone, Copy)]
+struct Hit {
+    piece: usize,
 }
 
 /// A position in the document: which piece, and how far into its text.
@@ -140,18 +288,33 @@ struct Baca {
     head: Option<Cursor>,
     dragging: bool,
     shown_title: String,
+    /// Where each outline entry's heading was laid out, refreshed every frame.
+    heading_pieces: Rc<RefCell<Vec<usize>>>,
+    /// Every occurrence of the query in the open document, in reading order.
+    hits: Rc<RefCell<Vec<Hit>>>,
+    query: String,
+    /// Whether keystrokes are going into the search field.
+    typing: bool,
+    hit: usize,
+    scale: f32,
+    outline: bool,
+    /// Which library entry the keyboard is on.
+    cursor: usize,
+    settings: Settings,
+    watch: Option<watch::Watch>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Baca {
-    fn new(root: Option<PathBuf>, cx: &mut gpui::Context<Self>) -> Self {
-        let entries = root.as_deref().map(scan).unwrap_or_default();
-        Self {
-            root,
-            entries,
+    fn new(settings: Settings, cx: &mut gpui::Context<Self>) -> Self {
+        let theme = Theme::from_label(&settings.theme).unwrap_or(Theme::Paper);
+        let mut baca = Self {
+            root: settings.root.clone(),
+            entries: Vec::new(),
             open: None,
             title: String::new(),
             doc: Default::default(),
-            theme: Theme::Paper,
+            theme,
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             pieces: Default::default(),
@@ -159,17 +322,148 @@ impl Baca {
             head: None,
             dragging: false,
             shown_title: String::new(),
+            heading_pieces: Default::default(),
+            hits: Default::default(),
+            query: String::new(),
+            typing: false,
+            hit: 0,
+            scale: settings.scale,
+            outline: settings.outline,
+            cursor: 0,
+            watch: watch::Watch::new(),
+            settings,
+            _subscriptions: Vec::new(),
+        };
+        baca.rescan(cx);
+        baca.observe_files(cx);
+        baca.autosave(cx);
+        if let Some(path) = baca.settings.open.clone() {
+            baca.read(path, cx);
+        }
+        baca
+    }
+
+    /// Persist the current shape of things, including where the reader is in
+    /// the open document.
+    fn remember(&mut self) {
+        self.settings.root = self.root.clone();
+        self.settings.open = self.open.clone();
+        self.settings.theme = self.theme.label().to_string();
+        self.settings.scale = self.scale;
+        self.settings.outline = self.outline;
+        if let Some(path) = &self.open {
+            let path = path.clone();
+            self.settings
+                .remember_position(&path, f32::from(self.scroll.offset().y));
+        }
+        self.settings.save();
+    }
+
+    /// Walk the library off the main thread: a large vault reads thousands of
+    /// files, which must not stall the frame.
+    fn rescan(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            self.entries.clear();
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let entries = cx.background_spawn(async move { scan(&root) }).await;
+            this.update(cx, |state, cx| {
+                state.entries = entries;
+                state.cursor = state.cursor.min(state.visible().len().saturating_sub(1));
+                cx.notify()
+            })
+        })
+        .detach();
+    }
+
+    /// Save the reading position now and then. Quitting fires `on_app_quit`,
+    /// but a process that is killed outright never gets there, and losing your
+    /// place in a long document is exactly what this is meant to prevent.
+    fn autosave(&mut self, cx: &mut gpui::Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            // `None`, not a NaN sentinel: every comparison against NaN is
+            // false, so the first save would never fire.
+            let mut saved: Option<f32> = None;
+            loop {
+                cx.background_executor().timer(AUTOSAVE_INTERVAL).await;
+                let carry_on = this.update(cx, |state, _| {
+                    let at = f32::from(state.scroll.offset().y);
+                    let moved = saved.is_none_or(|last| (at - last).abs() > 1.0);
+                    if state.open.is_some() && moved {
+                        saved = Some(at);
+                        state.remember();
+                    }
+                    true
+                });
+                if carry_on.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Poll the file watcher, reloading whatever actually changed.
+    fn observe_files(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.watch.is_none() {
+            return;
+        }
+        self.retarget_watch();
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(WATCH_INTERVAL).await;
+            let carry_on = this.update(cx, |state, cx| {
+                let Some(watcher) = &state.watch else {
+                    return false;
+                };
+                let changed = watcher.drain();
+                if changed.is_empty() {
+                    return true;
+                }
+                if let Some(open) = state.open.clone() {
+                    if watch::touches(&changed, &open) {
+                        // Keep the reading position: an edit elsewhere in the
+                        // file should not throw the reader back to the top.
+                        let offset = state.scroll.offset();
+                        state.read(open, cx);
+                        state.scroll.set_offset(offset);
+                    }
+                }
+                if changed.iter().any(|p| is_markdown(p) || p.is_dir()) {
+                    state.rescan(cx);
+                }
+                true
+            });
+            match carry_on {
+                Ok(true) => continue,
+                _ => break,
+            }
+        })
+        .detach();
+    }
+
+    fn retarget_watch(&mut self) {
+        let mut roots: Vec<PathBuf> = self.root.iter().cloned().collect();
+        // A document opened by path may sit outside the library entirely.
+        if let Some(open) = &self.open {
+            if !roots.iter().any(|r| open.starts_with(r)) {
+                roots.push(open.clone());
+            }
+        }
+        if let Some(watcher) = &mut self.watch {
+            watcher.observe(roots);
         }
     }
 
     fn reload(&mut self, cx: &mut gpui::Context<Self>) {
-        if let Some(r) = &self.root {
-            self.entries = scan(r)
-        }
+        self.rescan(cx);
         // Re-read whatever is on screen too, so Ctrl+R does the obvious thing
         // while reading rather than only refreshing the shelf.
         if let Some(path) = self.open.clone() {
+            let offset = self.scroll.offset();
             self.read(path, cx);
+            self.scroll.set_offset(offset);
             return;
         }
         cx.notify()
@@ -180,20 +474,39 @@ impl Baca {
         self.doc = markdown::parse(&source);
         self.title = self
             .doc
-            .outline
-            .first()
-            .map(|(_, text, _)| text.clone())
-            .or_else(|| {
-                path.file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-            })
+            .meta
+            .title()
+            .map(str::to_string)
+            .or_else(|| self.doc.outline.first().map(|(_, text, _)| text.clone()))
+            .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
             .unwrap_or_default();
+        let resumed = self.settings.position(&path);
         self.open = Some(path);
         self.anchor = None;
         self.head = None;
+        self.hit = 0;
         self.pieces.borrow_mut().clear();
-        self.scroll.scroll_to_item(0);
+        self.hits.borrow_mut().clear();
+        match resumed {
+            Some(y) => self.scroll.set_offset(point(px(0.), px(y))),
+            None => self.scroll.scroll_to_item(0),
+        }
+        self.retarget_watch();
+        self.remember();
         cx.notify()
+    }
+
+    /// Indices of the library entries passing the current filter. Indices,
+    /// not clones: an entry carries the whole file for searching, and cloning
+    /// the list every frame would copy the library on each repaint.
+    fn visible(&self) -> Vec<usize> {
+        let needle = self.query.to_lowercase();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.matches(&needle))
+            .map(|(ix, _)| ix)
+            .collect()
     }
 
     /// Resolve a link target the reader clicked. External URLs go to the
@@ -259,6 +572,202 @@ impl Baca {
                     || e.title.to_lowercase() == needle
             })
             .map(|e| e.path.clone())
+    }
+
+    /// Follow the desktop's light/dark preference, unless the reader has
+    /// already picked a theme by hand.
+    fn apply_system_theme(&mut self, dark: bool) {
+        if !self.settings.follow_system_theme {
+            return;
+        }
+        self.theme = Theme::for_system(dark);
+        self.settings.theme = self.theme.label().to_string();
+    }
+
+    /// Choosing a theme by hand means the desktop preference stops applying.
+    fn cycle_theme(&mut self, cx: &mut gpui::Context<Self>) {
+        self.theme = self.theme.next();
+        self.settings.follow_system_theme = false;
+        self.remember();
+        cx.notify()
+    }
+
+    /// A text size, scaled by the reader's zoom.
+    fn at(&self, base: f32) -> Pixels {
+        px(base * self.scale)
+    }
+
+    fn zoom(&mut self, to: f32, cx: &mut gpui::Context<Self>) {
+        // Rounded, so repeated steps do not drift to 1.3000001.
+        let clamped = (to * 10.).round() / 10.;
+        let clamped = clamped.clamp(0.6, 2.5);
+        if (clamped - self.scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.scale = clamped;
+        self.remember();
+        cx.notify()
+    }
+
+    fn scroll_by(&self, dy: Pixels, cx: &mut gpui::Context<Self>) {
+        let at = self.scroll.offset();
+        self.scroll.set_offset(point(at.x, at.y - dy));
+        cx.notify()
+    }
+
+    fn page(&self) -> Pixels {
+        // A page turn leaves a couple of lines of overlap to read across.
+        let height = self.scroll.bounds().size.height;
+        (height - self.at(size_of::BODY_LINE) * 2.).max(px(80.))
+    }
+
+    fn go_top(&self, cx: &mut gpui::Context<Self>) {
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify()
+    }
+
+    fn go_bottom(&self, cx: &mut gpui::Context<Self>) {
+        let max = self.scroll.max_offset();
+        self.scroll.set_offset(point(px(0.), -max.y));
+        cx.notify()
+    }
+
+    /// Bring a laid-out piece of text to just under the top of the page.
+    fn scroll_to_piece(&self, piece: usize, cx: &mut gpui::Context<Self>) {
+        let pieces = self.pieces.borrow();
+        let Some(target) = pieces.get(piece) else {
+            return;
+        };
+        let bounds = target.layout.bounds();
+        let viewport = self.scroll.bounds();
+        let at = self.scroll.offset();
+        let delta = bounds.top() - viewport.top() - self.at(size_of::BODY_LINE);
+        drop(pieces);
+        self.scroll.set_offset(point(at.x, at.y - delta));
+        cx.notify()
+    }
+
+    fn jump_to_heading(&self, ix: usize, cx: &mut gpui::Context<Self>) {
+        let piece = self.heading_pieces.borrow().get(ix).copied();
+        if let Some(piece) = piece {
+            self.scroll_to_piece(piece, cx);
+        }
+    }
+
+    fn start_search(&mut self, cx: &mut gpui::Context<Self>) {
+        self.typing = true;
+        self.hit = 0;
+        cx.notify()
+    }
+
+    fn cancel_search(&mut self, cx: &mut gpui::Context<Self>) {
+        self.typing = false;
+        self.query.clear();
+        self.hits.borrow_mut().clear();
+        self.cursor = 0;
+        cx.notify()
+    }
+
+    /// Step through the matches in the open document, wrapping at the ends.
+    fn step_hit(&mut self, forward: bool, cx: &mut gpui::Context<Self>) {
+        let count = self.hits.borrow().len();
+        if count == 0 {
+            return;
+        }
+        self.hit = if forward {
+            (self.hit + 1) % count
+        } else {
+            (self.hit + count - 1) % count
+        };
+        let piece = self.hits.borrow().get(self.hit).map(|h| h.piece);
+        if let Some(piece) = piece {
+            self.scroll_to_piece(piece, cx);
+        }
+        cx.notify()
+    }
+
+    /// Where the query occurs in one run of text, and which of those is the
+    /// match the reader is currently on.
+    fn matches_in(&self, text: &str, piece: usize) -> Vec<(Range<usize>, bool)> {
+        if self.query.is_empty() || self.open.is_none() {
+            return Vec::new();
+        }
+        let needle = self.query.to_lowercase();
+        let haystack = text.to_lowercase();
+        let mut found = Vec::new();
+        let mut at = 0;
+        while let Some(offset) = haystack[at..].find(&needle) {
+            let start = at + offset;
+            let end = start + needle.len();
+            // Byte offsets from a lowercased copy only line up with the
+            // original when the case folding did not change its length.
+            if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+                at = start + 1;
+                continue;
+            }
+            let mut hits = self.hits.borrow_mut();
+            let is_current = hits.len() == self.hit;
+            hits.push(Hit { piece });
+            drop(hits);
+            found.push((start..end, is_current));
+            at = end.max(start + 1);
+        }
+        found
+    }
+
+    /// Move the keyboard through the shelf.
+    fn step_entry(&mut self, forward: bool, cx: &mut gpui::Context<Self>) {
+        let count = self.visible().len();
+        if count == 0 {
+            return;
+        }
+        self.cursor = match forward {
+            true => (self.cursor + 1).min(count - 1),
+            false => self.cursor.saturating_sub(1),
+        };
+        cx.notify()
+    }
+
+    fn open_focused(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(&ix) = self.visible().get(self.cursor) else {
+            return;
+        };
+        let Some(path) = self.entries.get(ix).map(|e| e.path.clone()) else {
+            return;
+        };
+        self.typing = false;
+        self.query.clear();
+        self.read(path, cx);
+    }
+
+    /// Feed a keystroke to the search field. Returns whether it was consumed.
+    fn typed(&mut self, event: &KeyDownEvent, cx: &mut gpui::Context<Self>) -> bool {
+        if !self.typing {
+            return false;
+        }
+        let stroke = &event.keystroke;
+        if stroke.modifiers.control || stroke.modifiers.alt || stroke.modifiers.platform {
+            return false;
+        }
+        if stroke.key == "backspace" {
+            self.query.pop();
+            self.hit = 0;
+            self.cursor = 0;
+            cx.notify();
+            return true;
+        }
+        let Some(text) = stroke
+            .key_char
+            .as_ref()
+            .filter(|t| !t.is_empty() && !t.chars().any(|c| c.is_control()))
+        else {
+            return false;
+        };
+        self.query.push_str(text);
+        self.hit = 0;
+        self.cursor = 0;
+        cx.notify();
+        true
     }
 
     /// Record a run of laid-out text and hand back its position in the
@@ -332,14 +841,20 @@ impl Baca {
         let pieces = self.pieces.borrow();
         let mut out = Vec::new();
         for ix in start.piece..=end.piece {
-            let Some(piece) = pieces.get(ix) else { continue };
+            let Some(piece) = pieces.get(ix) else {
+                continue;
+            };
             let len = piece.text.len();
             let from = if ix == start.piece {
                 start.offset.min(len)
             } else {
                 0
             };
-            let to = if ix == end.piece { end.offset.min(len) } else { len };
+            let to = if ix == end.piece {
+                end.offset.min(len)
+            } else {
+                len
+            };
             if from < to {
                 out.push(piece.text[from..to].to_string());
             }
@@ -437,6 +952,10 @@ impl Baca {
 
         let styled = StyledText::new(source.clone());
         let piece = self.register(&source, styled.layout());
+        for (range, current) in self.matches_in(&source, piece) {
+            let tint = if current { p.match_now } else { p.match_any };
+            highlights = apply_selection(highlights, range, tint.into());
+        }
         if let Some(range) = self.selected_range(piece, source.len()) {
             highlights = apply_selection(highlights, range, p.selection.into());
         }
@@ -457,26 +976,25 @@ impl Baca {
             .into_any_element()
     }
 
-    fn block(
-        &self,
-        b: &Block,
-        p: &Palette,
-        id: usize,
-        this: &Entity<Self>,
-    ) -> gpui::AnyElement {
+    fn block(&self, b: &Block, p: &Palette, id: usize, this: &Entity<Self>) -> gpui::AnyElement {
         match b {
             Block::Heading { level, text, .. } => {
+                // The outline needs to know which laid-out run each heading
+                // became, so clicking an entry can scroll to it.
+                self.heading_pieces
+                    .borrow_mut()
+                    .push(self.pieces.borrow().len());
                 let base = div()
                     .font_family(theme::display())
                     .text_color(p.text)
                     .mt_7()
                     .mb_2();
                 let sized = match level {
-                    HeadingLevel::H1 => base.text_3xl(),
-                    HeadingLevel::H2 => base.text_2xl(),
-                    HeadingLevel::H3 => base.text_xl(),
-                    HeadingLevel::H4 => base.text_lg(),
-                    _ => base.text_base(),
+                    HeadingLevel::H1 => base.text_size(self.at(size_of::H1)),
+                    HeadingLevel::H2 => base.text_size(self.at(size_of::H2)),
+                    HeadingLevel::H3 => base.text_size(self.at(size_of::H3)),
+                    HeadingLevel::H4 => base.text_size(self.at(size_of::H4)),
+                    _ => base.text_size(self.at(size_of::H5)),
                 };
                 sized
                     .child(self.inline(text, p, id, this))
@@ -484,16 +1002,16 @@ impl Baca {
             }
             Block::Paragraph(t) => div()
                 .font_family(theme::body())
-                .text_lg()
-                .line_height(px(29.))
+                .text_size(self.at(size_of::BODY))
+                .line_height(self.at(size_of::BODY_LINE))
                 .text_color(p.text)
                 .mb_4()
                 .child(self.inline(t, p, id, this))
                 .into_any_element(),
             Block::Quote(t) => div()
                 .font_family(theme::body())
-                .text_lg()
-                .line_height(px(29.))
+                .text_size(self.at(size_of::BODY))
+                .line_height(self.at(size_of::BODY_LINE))
                 .text_color(p.text_muted)
                 .pl_5()
                 .my_5()
@@ -517,14 +1035,18 @@ impl Baca {
                         .collect();
                 let painted = StyledText::new(text.clone());
                 let piece = self.register(text, painted.layout());
+                for (range, current) in self.matches_in(text, piece) {
+                    let tint = if current { p.match_now } else { p.match_any };
+                    colors = apply_selection(colors, range, tint.into());
+                }
                 if let Some(range) = self.selected_range(piece, text.len()) {
                     colors = apply_selection(colors, range, p.selection.into());
                 }
                 let painted = painted.with_highlights(colors);
                 let body = div()
                     .font_family(theme::mono())
-                    .text_sm()
-                    .line_height(px(21.))
+                    .text_size(self.at(size_of::CODE))
+                    .line_height(self.at(size_of::CODE_LINE))
                     .text_color(p.text)
                     .child(painted);
                 div()
@@ -535,7 +1057,7 @@ impl Baca {
                     .children(lang.as_ref().map(|lang| {
                         div()
                             .font_family(theme::mono())
-                            .text_xs()
+                            .text_size(self.at(size_of::LABEL))
                             .text_color(p.text_faint)
                             .px_4()
                             .pt_2()
@@ -567,17 +1089,22 @@ impl Baca {
                             .w(px(26.))
                             .flex_none()
                             .font_family(theme::body())
-                            .text_lg()
-                            .line_height(px(29.))
+                            .text_size(self.at(size_of::BODY))
+                            .line_height(self.at(size_of::BODY_LINE))
                             .text_color(p.text_faint)
                             .child(glyph),
                     )
                     .child(
                         div()
                             .flex_1()
+                            // A flex item's automatic minimum width is its
+                            // min-content size, which for a run of text is the
+                            // whole line: without this the item refuses to
+                            // shrink and the text never wraps.
+                            .min_w_0()
                             .font_family(theme::body())
-                            .text_lg()
-                            .line_height(px(29.))
+                            .text_size(self.at(size_of::BODY))
+                            .line_height(self.at(size_of::BODY_LINE))
                             .text_color(if muted { p.text_muted } else { p.text })
                             .child(self.inline(text, p, id, this)),
                     )
@@ -591,10 +1118,11 @@ impl Baca {
                  -> gpui::AnyElement {
                     let mut c = div()
                         .flex_1()
+                        .min_w_0()
                         .px_3()
                         .py_2()
                         .font_family(theme::body())
-                        .text_base()
+                        .text_size(self.at(size_of::H5))
                         .text_color(if strong { p.text } else { p.text_muted })
                         .child(self.inline(text, p, cell_id, this));
                     c = match aligns.get(ix) {
@@ -604,29 +1132,25 @@ impl Baca {
                     };
                     c.into_any_element()
                 };
-                let mut table = div()
-                    .my_5()
-                    .border_1()
-                    .border_color(p.border)
-                    .child(
-                        div()
-                            .flex()
-                            .bg(p.bg_subtle)
-                            .border_b_1()
-                            .border_color(p.border_mid)
-                            .children(head.iter().enumerate().map(|(i, t)| {
-                                cell(t, i, id * 1000 + i, true)
-                            })),
-                    );
+                let mut table = div().my_5().border_1().border_color(p.border).child(
+                    div()
+                        .flex()
+                        .bg(p.bg_subtle)
+                        .border_b_1()
+                        .border_color(p.border_mid)
+                        .children(
+                            head.iter()
+                                .enumerate()
+                                .map(|(i, t)| cell(t, i, id * 1000 + i, true)),
+                        ),
+                );
                 for (r, row) in rows.iter().enumerate() {
                     table = table.child(
-                        div()
-                            .flex()
-                            .border_t_1()
-                            .border_color(p.border)
-                            .children(row.iter().enumerate().map(|(i, t)| {
-                                cell(t, i, id * 1000 + (r + 1) * 16 + i, false)
-                            })),
+                        div().flex().border_t_1().border_color(p.border).children(
+                            row.iter()
+                                .enumerate()
+                                .map(|(i, t)| cell(t, i, id * 1000 + (r + 1) * 16 + i, false)),
+                        ),
                     );
                 }
                 table.into_any_element()
@@ -649,7 +1173,7 @@ impl Baca {
                         .children((!alt.is_empty()).then(|| {
                             div()
                                 .font_family(theme::body())
-                                .text_sm()
+                                .text_size(self.at(size_of::SMALL))
                                 .text_color(p.text_faint)
                                 .mt_2()
                                 .child(alt.clone())
@@ -659,7 +1183,7 @@ impl Baca {
                         .child(
                             div()
                                 .font_family(theme::mono())
-                                .text_xs()
+                                .text_size(self.at(size_of::LABEL))
                                 .text_color(p.text_faint)
                                 .px_4()
                                 .py_6()
@@ -680,15 +1204,16 @@ impl Baca {
                         .flex_none()
                         .pr_3()
                         .font_family(theme::mono())
-                        .text_xs()
+                        .text_size(self.at(size_of::LABEL))
                         .text_color(p.accent)
                         .child(format!("[{label}]")),
                 )
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .font_family(theme::body())
-                        .text_sm()
+                        .text_size(self.at(size_of::SMALL))
                         .text_color(p.text_muted)
                         .child(self.inline(text, p, id, this)),
                 )
@@ -723,6 +1248,280 @@ impl Baca {
     }
 }
 
+impl Baca {
+    /// The sidebar: the outline of the open document, or the library's home.
+    fn sidebar(&self, p: &Palette, cx: &mut gpui::Context<Self>) -> gpui::AnyElement {
+        let mut panel = div()
+            .w(px(260.))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(p.bg_subtle)
+            .border_r_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .px_6()
+                    .pt_6()
+                    .child(
+                        div()
+                            .font_family(theme::display())
+                            .text_size(self.at(size_of::H3))
+                            .text_color(p.text)
+                            .child("baca"),
+                    )
+                    .child(
+                        div()
+                            .font_family(theme::mono())
+                            .text_size(self.at(size_of::LABEL))
+                            .text_color(p.text_faint)
+                            .mt_1()
+                            .child(if self.open.is_some() && self.outline {
+                                "CONTENTS"
+                            } else {
+                                "MARKDOWN LIBRARY"
+                            }),
+                    ),
+            );
+
+        let showing_outline = self.open.is_some() && self.outline && !self.doc.outline.is_empty();
+        if showing_outline {
+            let smallest = self
+                .doc
+                .outline
+                .iter()
+                .map(|(level, _, _)| *level as usize)
+                .min()
+                .unwrap_or(1);
+            panel =
+                panel.child(
+                    div()
+                        .id("outline")
+                        .flex_1()
+                        .overflow_scroll()
+                        .px_4()
+                        .pt_4()
+                        .pb_6()
+                        .children(self.doc.outline.iter().enumerate().map(
+                            |(ix, (level, text, _))| {
+                                let depth = (*level as usize).saturating_sub(smallest);
+                                div()
+                                    .id(("outline", ix))
+                                    .cursor_pointer()
+                                    .py_1()
+                                    .pl(px(8. + depth as f32 * 12.))
+                                    .pr_2()
+                                    .font_family(theme::body())
+                                    .text_size(self.at(size_of::SMALL))
+                                    .text_color(if depth == 0 { p.text } else { p.text_muted })
+                                    .hover(|this| this.bg(p.bg_raised))
+                                    .on_click(cx.listener(move |state, _, _, cx| {
+                                        state.jump_to_heading(ix, cx)
+                                    }))
+                                    .child(text.clone())
+                            },
+                        )),
+                );
+        } else {
+            panel = panel.child(
+                div()
+                    .flex_1()
+                    .px_6()
+                    .pt_8()
+                    .child(
+                        div()
+                            .font_family(theme::body())
+                            .text_size(self.at(size_of::SMALL))
+                            .text_color(p.text_muted)
+                            .child(
+                                self.root
+                                    .as_ref()
+                                    .map(|x| x.display().to_string())
+                                    .unwrap_or_else(|| "Choose a folder — Ctrl+O".into()),
+                            ),
+                    )
+                    .children(self.open.is_some().then(|| {
+                        div()
+                            .font_family(theme::mono())
+                            .text_size(self.at(size_of::LABEL))
+                            .text_color(p.text_faint)
+                            .mt_4()
+                            .child("No headings — Ctrl+B")
+                    })),
+            );
+        }
+
+        // Tags from the front matter say what a note is filed under.
+        let tags = self.doc.meta.tags();
+        if self.open.is_some() && !tags.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_6()
+                    .pb_6()
+                    .pt_4()
+                    .border_t_1()
+                    .border_color(p.border)
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(tags.into_iter().map(|tag| {
+                        div()
+                            .px_2()
+                            .py_1()
+                            .bg(p.bg_raised)
+                            .font_family(theme::mono())
+                            .text_size(self.at(size_of::LABEL))
+                            .text_color(p.text_muted)
+                            .child(tag)
+                    })),
+            );
+        }
+        panel.into_any_element()
+    }
+
+    /// The strip above the page: what the keys do, and the search field.
+    fn header(&self, p: &Palette, cx: &mut gpui::Context<Self>) -> gpui::AnyElement {
+        let label = |text: String| {
+            div()
+                .font_family(theme::mono())
+                .text_size(self.at(size_of::LABEL))
+                .text_color(p.accent)
+                .child(text)
+        };
+        if self.typing || !self.query.is_empty() {
+            let hits = self.hits.borrow().len();
+            let tally = if self.open.is_none() {
+                format!("{} of {} notes", self.visible().len(), self.entries.len())
+            } else if hits == 0 {
+                "no matches".to_string()
+            } else {
+                format!("{} of {hits}", self.hit + 1)
+            };
+            return div()
+                .h(px(76.))
+                .flex()
+                .items_center()
+                .gap_3()
+                .border_b_1()
+                .border_color(p.border)
+                .child(label("FIND".into()))
+                .child(
+                    div()
+                        .flex_1()
+                        .font_family(theme::mono())
+                        .text_size(self.at(size_of::SMALL))
+                        .text_color(p.text)
+                        .child(if self.query.is_empty() {
+                            // A caret alone reads as "type here".
+                            "|".to_string()
+                        } else if self.typing {
+                            format!("{}|", self.query)
+                        } else {
+                            self.query.clone()
+                        }),
+                )
+                .child(
+                    div()
+                        .font_family(theme::mono())
+                        .text_size(self.at(size_of::LABEL))
+                        .text_color(p.text_faint)
+                        .child(tally),
+                )
+                .into_any_element();
+        }
+        div()
+            .h(px(76.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_6()
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .id("choose")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|state, _, _, cx| state.choose(cx)))
+                    .child(label("Choose folder  Ctrl+O".into())),
+            )
+            .child(label("Find  Ctrl+F".into()))
+            .child(
+                div()
+                    .id("theme")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|state, _, _, cx| state.cycle_theme(cx)))
+                    .child(label(format!("{}  Ctrl+T", self.theme.label()))),
+            )
+            .into_any_element()
+    }
+
+    /// The shelf of documents, filtered by the current query.
+    fn shelf(&self, p: &Palette, cx: &mut gpui::Context<Self>) -> gpui::AnyElement {
+        let entries = self.visible();
+        let summary = if self.query.is_empty() {
+            format!("{} Markdown files", entries.len())
+        } else {
+            format!(
+                "{} of {} match “{}”",
+                entries.len(),
+                self.entries.len(),
+                self.query
+            )
+        };
+        div()
+            .pt_10()
+            .child(
+                div()
+                    .font_family(theme::display())
+                    .text_size(self.at(size_of::TITLE))
+                    .text_color(p.text)
+                    .child("Your reading shelf"),
+            )
+            .child(
+                div()
+                    .font_family(theme::body())
+                    .text_size(self.at(size_of::BODY))
+                    .text_color(p.text_muted)
+                    .mb_8()
+                    .child(summary),
+            )
+            .children(entries.into_iter().enumerate().filter_map(|(row, ix)| {
+                let entry = self.entries.get(ix)?;
+                let path = entry.path.clone();
+                let focused = row == self.cursor;
+                Some(
+                    div()
+                        .id(("entry", row))
+                        .cursor_pointer()
+                        .py_5()
+                        .px_3()
+                        .border_t_1()
+                        .border_color(p.border)
+                        .when(focused, |this| this.bg(p.bg_subtle))
+                        .hover(|this| this.bg(p.bg_subtle))
+                        .on_click(cx.listener(move |state, _, _, cx| state.read(path.clone(), cx)))
+                        .child(
+                            div()
+                                .font_family(theme::display())
+                                .text_size(self.at(size_of::H3))
+                                .text_color(p.text)
+                                .child(entry.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .font_family(theme::body())
+                                .text_size(self.at(size_of::H5))
+                                .text_color(p.text_muted)
+                                .mt_1()
+                                .child(entry.preview.clone()),
+                        ),
+                )
+            }))
+            .into_any_element()
+    }
+}
+
 impl Render for Baca {
     fn render(
         &mut self,
@@ -741,198 +1540,200 @@ impl Render for Baca {
         }
         let p = self.theme.palette();
         let this = cx.entity();
-        // Pieces are re-registered from scratch each frame, in document order,
-        // so the indices a selection holds stay meaningful between frames.
+        // These are re-registered from scratch each frame, in document order,
+        // so the indices a selection or a search holds stay meaningful.
         self.pieces.borrow_mut().clear();
-        let es = self.entries.clone();
+        self.heading_pieces.borrow_mut().clear();
+        self.hits.borrow_mut().clear();
+
+        let reading = self.open.is_some();
+        let body = if reading {
+            div()
+                .pt_10()
+                // A document that opens on its own heading already states its
+                // title.
+                .children((!self.opens_with_heading()).then(|| {
+                    div()
+                        .font_family(theme::display())
+                        .text_size(self.at(size_of::TITLE))
+                        .text_color(p.text)
+                        .child(self.title.clone())
+                }))
+                .children(
+                    self.doc
+                        .blocks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| self.block(b, &p, i, &this)),
+                )
+                .into_any_element()
+        } else {
+            self.shelf(&p, cx)
+        };
+        let header = self.header(&p, cx);
         div()
             .size_full()
             .bg(p.bg)
             .track_focus(&self.focus)
-            .key_context("Baca")
+            .key_context(if self.typing { "BacaSearch" } else { "Baca" })
+            .on_key_down(cx.listener(|state, event: &KeyDownEvent, _, cx| {
+                state.typed(event, cx);
+            }))
             .on_action(cx.listener(|s, _: &ChooseFolder, _, cx| s.choose(cx)))
             .on_action(cx.listener(|s, _: &Reload, _, cx| s.reload(cx)))
-            .on_action(cx.listener(|s, _: &CycleTheme, _, cx| {
-                s.theme = s.theme.next();
-                cx.notify()
-            }))
+            .on_action(cx.listener(|s, _: &CycleTheme, _, cx| s.cycle_theme(cx)))
             .on_action(cx.listener(|s, _: &Library, _, cx| {
                 s.open = None;
+                s.query.clear();
+                s.typing = false;
+                s.cursor = 0;
+                s.remember();
                 cx.notify()
             }))
             .on_action(cx.listener(|s, _: &CopySelection, _, cx| s.copy_selection(cx)))
             .on_action(cx.listener(|s, _: &SelectAll, _, cx| s.select_all(cx)))
+            .on_action(cx.listener(|s, _: &StartSearch, _, cx| s.start_search(cx)))
+            .on_action(cx.listener(|s, _: &CancelSearch, _, cx| s.cancel_search(cx)))
+            .on_action(cx.listener(|s, _: &AcceptSearch, _, cx| {
+                s.typing = false;
+                // In the shelf, committing a search opens what it found.
+                if s.open.is_none() {
+                    s.open_focused(cx);
+                }
+                cx.notify()
+            }))
+            .on_action(cx.listener(|s, _: &FindNext, _, cx| {
+                if s.open.is_some() {
+                    s.step_hit(true, cx)
+                } else {
+                    s.step_entry(true, cx)
+                }
+            }))
+            .on_action(cx.listener(|s, _: &FindPrev, _, cx| {
+                if s.open.is_some() {
+                    s.step_hit(false, cx)
+                } else {
+                    s.step_entry(false, cx)
+                }
+            }))
+            .on_action(cx.listener(|s, _: &ZoomIn, _, cx| {
+                let to = s.scale + 0.1;
+                s.zoom(to, cx)
+            }))
+            .on_action(cx.listener(|s, _: &ZoomOut, _, cx| {
+                let to = s.scale - 0.1;
+                s.zoom(to, cx)
+            }))
+            .on_action(cx.listener(|s, _: &ZoomReset, _, cx| s.zoom(1.0, cx)))
+            .on_action(cx.listener(|s, _: &LineDown, _, cx| {
+                let step = s.at(size_of::BODY_LINE) * 3.;
+                s.scroll_by(step, cx)
+            }))
+            .on_action(cx.listener(|s, _: &LineUp, _, cx| {
+                let step = s.at(size_of::BODY_LINE) * 3.;
+                s.scroll_by(-step, cx)
+            }))
+            .on_action(cx.listener(|s, _: &PageDown, _, cx| {
+                let step = s.page();
+                s.scroll_by(step, cx)
+            }))
+            .on_action(cx.listener(|s, _: &PageUp, _, cx| {
+                let step = s.page();
+                s.scroll_by(-step, cx)
+            }))
+            .on_action(cx.listener(|s, _: &GoTop, _, cx| s.go_top(cx)))
+            .on_action(cx.listener(|s, _: &GoBottom, _, cx| s.go_bottom(cx)))
+            .on_action(cx.listener(|s, _: &ToggleOutline, _, cx| {
+                s.outline = !s.outline;
+                s.remember();
+                cx.notify()
+            }))
+            // In the shelf the arrows walk the list; in a document they scroll.
+            .on_action(cx.listener(|s, _: &NextEntry, _, cx| {
+                if s.open.is_some() {
+                    let step = s.at(size_of::BODY_LINE) * 3.;
+                    s.scroll_by(step, cx)
+                } else {
+                    s.step_entry(true, cx)
+                }
+            }))
+            .on_action(cx.listener(|s, _: &PrevEntry, _, cx| {
+                if s.open.is_some() {
+                    let step = s.at(size_of::BODY_LINE) * 3.;
+                    s.scroll_by(-step, cx)
+                } else {
+                    s.step_entry(false, cx)
+                }
+            }))
+            .on_action(cx.listener(|s, _: &OpenEntry, _, cx| {
+                if s.open.is_none() {
+                    s.open_focused(cx)
+                }
+            }))
             .child(
-                div()
-                    .h_full()
-                    .flex()
-                    .child(
-                        div()
-                            .w(px(250.))
-                            .h_full()
-                            .bg(p.bg_subtle)
-                            .border_r_1()
-                            .border_color(p.border)
-                            .p_6()
-                            .child(
-                                div()
-                                    .font_family(theme::display())
-                                    .text_xl()
-                                    .text_color(p.text)
-                                    .child("baca"),
-                            )
-                            .child(
-                                div()
-                                    .font_family(theme::mono())
-                                    .text_xs()
-                                    .text_color(p.text_faint)
-                                    .mt_1()
-                                    .child("MARKDOWN LIBRARY"),
-                            )
-                            .child(
-                                div()
-                                    .font_family(theme::body())
-                                    .text_sm()
-                                    .text_color(p.text_muted)
-                                    .mt_8()
-                                    .child(
-                                        self.root
-                                            .as_ref()
-                                            .map(|x| x.display().to_string())
-                                            .unwrap_or_else(|| "Choose a folder".into()),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("scroll")
-                            .flex_1()
-                            .h_full()
-                            .overflow_scroll()
-                            .track_scroll(&self.scroll)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|s, e: &MouseDownEvent, _, cx| {
-                                    s.anchor = s.cursor_at(e.position);
-                                    s.head = s.anchor;
-                                    s.dragging = s.anchor.is_some();
-                                    cx.notify()
-                                }),
-                            )
-                            .on_mouse_move(cx.listener(|s, e: &MouseMoveEvent, _, cx| {
-                                if s.dragging {
-                                    s.head = s.cursor_at(e.position);
-                                    cx.notify()
-                                }
-                            }))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|s, _: &MouseUpEvent, _, cx| {
-                                    s.dragging = false;
-                                    cx.notify()
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .max_w(px(900.))
-                                    .mx_auto()
-                                    .px_10()
-                                    .pb_16()
-                                    .child(
-                                        div()
-                                            .h(px(76.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .border_b_1()
-                                            .border_color(p.border)
-                                            .child(
-                                                div()
-                                                    .font_family(theme::mono())
-                                                    .text_xs()
-                                                    .text_color(p.accent)
-                                                    .child("Choose folder  Ctrl+O"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .font_family(theme::mono())
-                                                    .text_xs()
-                                                    .text_color(p.accent)
-                                                    .child(format!(
-                                                        "{}  Ctrl+T",
-                                                        self.theme.label()
-                                                    )),
-                                            ),
-                                    )
-                                    .child(if self.open.is_some() {
-                                        div()
-                                            .pt_10()
-                                            // A document that opens on its own
-                                            // heading already states its title.
-                                            .children((!self.opens_with_heading()).then(|| {
-                                                div()
-                                                    .font_family(theme::display())
-                                                    .text_3xl()
-                                                    .text_color(p.text)
-                                                    .child(self.title.clone())
-                                            }))
-                                            .children(
-                                                self.doc
-                                                    .blocks
-                                                    .iter()
-                                                    .enumerate()
-                                                    .map(|(i, b)| self.block(b, &p, i, &this)),
-                                            )
-                                            .into_any_element()
-                                    } else {
-                                        div()
-                                            .pt_10()
-                                            .child(
-                                                div()
-                                                    .font_family(theme::display())
-                                                    .text_3xl()
-                                                    .text_color(p.text)
-                                                    .child("Your reading shelf"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .font_family(theme::body())
-                                                    .text_lg()
-                                                    .text_color(p.text_muted)
-                                                    .mb_8()
-                                                    .child(format!("{} Markdown files", es.len())),
-                                            )
-                                            .children(es.into_iter().enumerate().map(|(i, e)| {
-                                                let path = e.path.clone();
-                                                div()
-                                                    .id(("entry", i))
-                                                    .cursor_pointer()
-                                                    .py_5()
-                                                    .border_t_1()
-                                                    .border_color(p.border)
-                                                    .on_click(cx.listener(move |s, _, _, cx| {
-                                                        s.read(path.clone(), cx)
-                                                    }))
-                                                    .child(
-                                                        div()
-                                                            .font_family(theme::display())
-                                                            .text_xl()
-                                                            .text_color(p.text)
-                                                            .child(e.title),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .font_family(theme::body())
-                                                            .text_base()
-                                                            .text_color(p.text_muted)
-                                                            .mt_1()
-                                                            .child(e.preview),
-                                                    )
-                                            }))
-                                            .into_any_element()
+                div().h_full().flex().child(self.sidebar(&p, cx)).child(
+                    div()
+                        .flex_1()
+                        // Without this the page's own width wins and squeezes
+                        // the sidebar instead of scrolling.
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        // The header stays put: a search tally is no use
+                        // if stepping through matches scrolls it away.
+                        .child(
+                            div()
+                                .w_full()
+                                .flex_none()
+                                .flex()
+                                .justify_center()
+                                .child(div().w_full().max_w(COLUMN).px_10().child(header)),
+                        )
+                        .child(
+                            div()
+                                .id("scroll")
+                                .flex_1()
+                                .min_h_0()
+                                // Vertical only: prose that scrolls sideways
+                                // has simply failed to wrap.
+                                .overflow_y_scroll()
+                                .track_scroll(&self.scroll)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|s, e: &MouseDownEvent, _, cx| {
+                                        s.anchor = s.cursor_at(e.position);
+                                        s.head = s.anchor;
+                                        s.dragging = s.anchor.is_some();
+                                        cx.notify()
                                     }),
-                            ),
-                    ),
+                                )
+                                .on_mouse_move(cx.listener(|s, e: &MouseMoveEvent, _, cx| {
+                                    if s.dragging {
+                                        s.head = s.cursor_at(e.position);
+                                        cx.notify()
+                                    }
+                                }))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|s, _: &MouseUpEvent, _, cx| {
+                                        s.dragging = false;
+                                        cx.notify()
+                                    }),
+                                )
+                                .child(
+                                    div().w_full().flex().justify_center().child(
+                                        div()
+                                            .w_full()
+                                            .max_w(COLUMN)
+                                            .px_10()
+                                            .pb_16()
+                                            .pt_2()
+                                            .child(body),
+                                    ),
+                                ),
+                        ),
+                ),
             )
     }
 }
@@ -945,15 +1746,50 @@ fn main() {
     let root = target
         .filter(|p| p.is_dir())
         .or_else(|| file.as_ref().and_then(|f| f.parent().map(PathBuf::from)));
+    let mut settings = Settings::load();
+    // An argument on the command line wins over the remembered library.
+    if root.is_some() {
+        settings.root = root;
+    }
     gpui_platform::application().run(move |cx: &mut App| {
         theme::load_fonts(cx);
         cx.bind_keys([
-            KeyBinding::new("ctrl-o", ChooseFolder, Some("Baca")),
-            KeyBinding::new("ctrl-r", Reload, Some("Baca")),
-            KeyBinding::new("ctrl-t", CycleTheme, Some("Baca")),
+            // Available whether or not the search field has the keyboard.
+            KeyBinding::new("ctrl-o", ChooseFolder, None),
+            KeyBinding::new("ctrl-r", Reload, None),
+            KeyBinding::new("ctrl-t", CycleTheme, None),
+            KeyBinding::new("ctrl-c", CopySelection, None),
+            KeyBinding::new("ctrl-a", SelectAll, None),
+            KeyBinding::new("ctrl-f", StartSearch, None),
+            KeyBinding::new("ctrl-b", ToggleOutline, None),
+            KeyBinding::new("ctrl-=", ZoomIn, None),
+            KeyBinding::new("ctrl-+", ZoomIn, None),
+            KeyBinding::new("ctrl--", ZoomOut, None),
+            KeyBinding::new("ctrl-0", ZoomReset, None),
+            // Typing into the search field must not also scroll the page, so
+            // the bare keys live in the reading context only.
+            KeyBinding::new("escape", Library, Some("Baca")),
             KeyBinding::new("alt-left", Library, Some("Baca")),
-            KeyBinding::new("ctrl-c", CopySelection, Some("Baca")),
-            KeyBinding::new("ctrl-a", SelectAll, Some("Baca")),
+            KeyBinding::new("j", LineDown, Some("Baca")),
+            KeyBinding::new("k", LineUp, Some("Baca")),
+            KeyBinding::new("down", NextEntry, Some("Baca")),
+            KeyBinding::new("up", PrevEntry, Some("Baca")),
+            KeyBinding::new("enter", OpenEntry, Some("Baca")),
+            KeyBinding::new("space", PageDown, Some("Baca")),
+            KeyBinding::new("shift-space", PageUp, Some("Baca")),
+            KeyBinding::new("pagedown", PageDown, Some("Baca")),
+            KeyBinding::new("pageup", PageUp, Some("Baca")),
+            KeyBinding::new("g", GoTop, Some("Baca")),
+            KeyBinding::new("shift-g", GoBottom, Some("Baca")),
+            KeyBinding::new("home", GoTop, Some("Baca")),
+            KeyBinding::new("end", GoBottom, Some("Baca")),
+            KeyBinding::new("n", FindNext, Some("Baca")),
+            KeyBinding::new("shift-n", FindPrev, Some("Baca")),
+            // While searching, the same keys steer the search instead.
+            KeyBinding::new("escape", CancelSearch, Some("BacaSearch")),
+            KeyBinding::new("enter", AcceptSearch, Some("BacaSearch")),
+            KeyBinding::new("down", FindNext, Some("BacaSearch")),
+            KeyBinding::new("up", FindPrev, Some("BacaSearch")),
         ]);
         let b = Bounds::centered(None, size(px(1100.), px(760.)), cx);
         cx.open_window(
@@ -969,20 +1805,121 @@ fn main() {
                 window_min_size: Some(size(px(480.), px(360.))),
                 ..Default::default()
             },
-            move |w, cx| {
-                let x = cx.new(|cx| {
-                    let mut state = Baca::new(root, cx);
+            move |window, cx| {
+                let dark = matches!(
+                    window.appearance(),
+                    gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                );
+                let baca = cx.new(|cx| {
+                    let mut state = Baca::new(settings, cx);
+                    state.apply_system_theme(dark);
+                    // An explicit argument outranks whatever was last open.
                     if let Some(file) = file {
                         state.read(file, cx);
                     }
                     state
                 });
-                let f = x.read(cx).focus.clone();
-                w.focus(&f, cx);
-                x
+
+                let watcher = baca.clone();
+                let appearance = window.observe_window_appearance(move |window, cx| {
+                    let dark = matches!(
+                        window.appearance(),
+                        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                    );
+                    watcher.update(cx, |state, cx| {
+                        state.apply_system_theme(dark);
+                        cx.notify()
+                    });
+                });
+
+                let quitting = baca.clone();
+                let quit = cx.on_app_quit(move |cx| {
+                    quitting.update(cx, |state, _| state.remember());
+                    async {}
+                });
+
+                baca.update(cx, |state, _| {
+                    state._subscriptions.push(appearance);
+                    state._subscriptions.push(quit);
+                });
+
+                let focus = baca.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                baca
             },
         )
         .unwrap();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn front_matter_is_kept_out_of_the_shelf() {
+        let (title, preview) = summarize(
+            "---\ntitle: A Note\ntags: x\n---\n\n# Ignored heading\n\nThe body.\n",
+            "file.md",
+        );
+        assert_eq!(title, "A Note");
+        assert_eq!(preview, "Ignored heading");
+    }
+
+    #[test]
+    fn a_plain_document_uses_its_heading() {
+        let (title, preview) = summarize("# Heading\n\nFirst **line**.\n", "file.md");
+        assert_eq!(title, "Heading");
+        assert_eq!(preview, "First line.");
+    }
+
+    #[test]
+    fn front_matter_without_a_title_falls_back_to_the_heading() {
+        let (title, preview) = summarize("---\ntags: x\n---\n\n# Heading\n\nBody.\n", "f.md");
+        assert_eq!(title, "Heading");
+        assert_eq!(preview, "Body.");
+    }
+
+    #[test]
+    fn an_opening_rule_is_not_front_matter() {
+        let (meta, body) = split_front_matter("---\n\nJust a rule above.\n");
+        assert_eq!(meta, "");
+        assert!(body.contains("Just a rule above."));
+    }
+
+    #[test]
+    fn a_preview_reads_as_prose_not_source() {
+        assert_eq!(strip_markup("![A figure](figure.png)"), "A figure");
+        assert_eq!(
+            strip_markup("See [the docs](http://x/y) now"),
+            "See the docs now"
+        );
+        assert_eq!(strip_markup("**bold** and `code`"), "bold and code");
+        assert_eq!(strip_markup("plain text"), "plain text");
+        // An unpaired bracket is literal text in Markdown, so it stays.
+        assert_eq!(strip_markup("an [unclosed link"), "an [unclosed link");
+    }
+
+    #[test]
+    fn an_empty_document_falls_back_to_its_filename() {
+        let (title, preview) = summarize("", "notes.md");
+        assert_eq!(title, "notes.md");
+        assert_eq!(preview, "No preview available.");
+    }
+
+    #[test]
+    fn filtering_matches_title_path_and_body() {
+        let entry = Entry {
+            path: PathBuf::from("/vault/deep/note.md"),
+            title: "Rust".into(),
+            preview: String::new(),
+            haystack: "rust\n/vault/deep/note.md\nabout ownership".to_lowercase(),
+        };
+        assert!(entry.matches("rust"));
+        assert!(entry.matches("ownership"), "body text is searchable");
+        assert!(entry.matches("deep"), "the path is searchable");
+        assert!(entry.matches(""), "an empty query matches everything");
+        assert!(!entry.matches("python"));
+    }
 }

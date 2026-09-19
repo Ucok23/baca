@@ -1,6 +1,5 @@
-use pulldown_cmark::{
-    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
-};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use std::collections::BTreeMap;
 
 /// The typographic variations a run of text can carry. These compose, so a span
 /// can be bold and italic and struck through at once.
@@ -78,10 +77,73 @@ pub enum Block {
     Rule,
 }
 
+/// Front matter, kept as it was written. baca reads it for a title, a date and
+/// tags; anything else is still shown, rather than silently dropped.
+#[derive(Clone, Default)]
+pub struct Meta {
+    pub fields: BTreeMap<String, String>,
+}
+
+impl Meta {
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.fields.get(key).map(String::as_str)
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.get("title")
+    }
+
+    /// Tags written either as `tags: a, b` or as a YAML list.
+    pub fn tags(&self) -> Vec<String> {
+        let Some(raw) = self.get("tags").or_else(|| self.get("keywords")) else {
+            return Vec::new();
+        };
+        raw.trim_matches(['[', ']'].as_slice())
+            .split([',', '\n'])
+            .map(|t| t.trim().trim_start_matches('-').trim().trim_matches('"'))
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// Parse the flat `key: value` subset of YAML that note front matter uses.
+/// A nested block or a list is kept as its raw text rather than guessed at.
+fn parse_meta(source: &str) -> Meta {
+    let mut fields: BTreeMap<String, String> = BTreeMap::new();
+    let mut key: Option<String> = None;
+    for line in source.lines() {
+        let indented = line.starts_with([' ', '\t']) || line.trim_start().starts_with('-');
+        if indented {
+            if let Some(key) = &key {
+                let entry = fields.entry(key.clone()).or_default();
+                if !entry.is_empty() {
+                    entry.push('\n');
+                }
+                entry.push_str(line.trim());
+            }
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let value = value.trim().trim_matches(['"', '\'']).to_string();
+        key = Some(name.to_string());
+        fields.insert(name.to_string(), value);
+    }
+    fields.retain(|_, value| !value.is_empty());
+    Meta { fields }
+}
+
 #[derive(Clone, Default)]
 pub struct Document {
     pub blocks: Vec<Block>,
     pub outline: Vec<(HeadingLevel, String, String)>,
+    pub meta: Meta,
 }
 
 /// The link scheme a footnote reference carries, so the renderer can tell one
@@ -114,6 +176,7 @@ struct Builder {
     image: Option<(String, usize)>,
     table: Option<TableState>,
     footnote: Option<String>,
+    meta: Option<String>,
 }
 
 impl Builder {
@@ -131,9 +194,7 @@ impl Builder {
             return;
         }
         match self.spans.last_mut() {
-            Some(last) if last.style == style && last.link == self.link => {
-                last.text.push_str(text)
-            }
+            Some(last) if last.style == style && last.link == self.link => last.text.push_str(text),
             _ => self.spans.push(Span {
                 text: text.into(),
                 style,
@@ -270,7 +331,9 @@ pub fn parse(source: &str) -> Document {
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_SMART_PUNCTUATION
-        | Options::ENABLE_HEADING_ATTRIBUTES;
+        | Options::ENABLE_HEADING_ATTRIBUTES
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
     let mut b = Builder::default();
     let mut code = String::new();
 
@@ -295,6 +358,16 @@ pub fn parse(source: &str) -> Document {
             Event::End(TagEnd::BlockQuote(_)) => {
                 b.flush();
                 b.quote = b.quote.saturating_sub(1);
+            }
+
+            Event::Start(Tag::MetadataBlock(_)) => {
+                b.flush();
+                b.meta = Some(String::new());
+            }
+            Event::End(TagEnd::MetadataBlock(_)) => {
+                if let Some(raw) = b.meta.take() {
+                    b.doc.meta = parse_meta(&raw);
+                }
             }
 
             Event::Start(Tag::CodeBlock(kind)) => {
@@ -418,7 +491,9 @@ pub fn parse(source: &str) -> Document {
             }
 
             Event::Text(value) => {
-                if b.code.is_some() {
+                if let Some(meta) = &mut b.meta {
+                    meta.push_str(&value);
+                } else if b.code.is_some() {
                     code.push_str(&value);
                 } else {
                     let style = b.style();
@@ -446,9 +521,7 @@ pub fn parse(source: &str) -> Document {
             }
             // Raw HTML is not rendered, but a lone `<br>` is a line break
             // people actually rely on in Markdown notes.
-            Event::Html(value) | Event::InlineHtml(value)
-                if value.trim().starts_with("<br") =>
-            {
+            Event::Html(value) | Event::InlineHtml(value) if value.trim().starts_with("<br") => {
                 let style = b.style();
                 b.push("\n", style);
             }
@@ -615,6 +688,33 @@ mod tests {
     fn soft_breaks_do_not_glue_words_together() {
         let got = spans("one\ntwo");
         assert_eq!(got[0].0, "one two");
+    }
+
+    #[test]
+    fn front_matter_is_metadata_not_content() {
+        let doc = parse("---\ntitle: A note\ndate: 2026-09-20\ntags: alpha, beta\n---\n\nBody.\n");
+        assert_eq!(doc.meta.title(), Some("A note"));
+        assert_eq!(doc.meta.get("date"), Some("2026-09-20"));
+        assert_eq!(doc.meta.tags(), vec!["alpha", "beta"]);
+        assert_eq!(
+            doc.blocks.len(),
+            1,
+            "front matter must not render as a block"
+        );
+        assert!(matches!(&doc.blocks[0], Block::Paragraph(t) if t.plain() == "Body."));
+    }
+
+    #[test]
+    fn yaml_list_tags_are_read() {
+        let doc = parse("---\ntags:\n  - alpha\n  - beta\n---\n\nBody.\n");
+        assert_eq!(doc.meta.tags(), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_horizontal_rule_is_not_front_matter() {
+        let doc = parse("Text.\n\n---\n\nMore text.\n");
+        assert!(doc.meta.fields.is_empty());
+        assert!(doc.blocks.iter().any(|b| matches!(b, Block::Rule)));
     }
 
     fn name(b: &Block) -> &'static str {
