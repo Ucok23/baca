@@ -16,6 +16,7 @@ use markdown::{Block, Marker};
 use pulldown_cmark::{Alignment, HeadingLevel};
 use settings::Settings;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -79,6 +80,9 @@ mod size_of {
 }
 
 const MARKDOWN_EXTENSIONS: [&str; 3] = ["md", "markdown", "mdx"];
+
+/// One entry of a document's outline: its level, its text, and its anchor.
+type Heading = (HeadingLevel, String, String);
 
 fn is_markdown(path: &Path) -> bool {
     path.extension()
@@ -229,6 +233,82 @@ enum HomeItem {
     Collection(PathBuf),
 }
 
+/// The outline entries on show, once folded groups are taken out. A folded
+/// entry hides everything nested under it, down to the next heading at its own
+/// level or shallower.
+fn visible_outline(outline: &[Heading], collapsed: &HashSet<usize>) -> Vec<usize> {
+    let mut rows = Vec::new();
+    let mut hidden_below: Option<usize> = None;
+    for (ix, (level, _, _)) in outline.iter().enumerate() {
+        let level = *level as usize;
+        if let Some(limit) = hidden_below {
+            if level > limit {
+                continue;
+            }
+            hidden_below = None;
+        }
+        rows.push(ix);
+        if collapsed.contains(&ix) {
+            hidden_below = Some(level);
+        }
+    }
+    rows
+}
+
+/// Whether an outline entry has anything nested under it.
+fn has_children(outline: &[Heading], ix: usize) -> bool {
+    let Some((level, _, _)) = outline.get(ix) else {
+        return false;
+    };
+    outline
+        .get(ix + 1)
+        .is_some_and(|(next, _, _)| *next as usize > *level as usize)
+}
+
+/// Column widths for a table, as fractions of its width.
+///
+/// A column of "yes"/"no" does not deserve as much room as a column of prose,
+/// but one long cell should not swallow the table either. Weights are the
+/// square root of the longest cell, so a column ten times wordier gets more
+/// room but not ten times more, and every column keeps a readable minimum.
+fn column_widths(head: &[markdown::Text], rows: &[Vec<markdown::Text>]) -> Vec<f32> {
+    let columns = head.len().max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    if columns == 0 {
+        return Vec::new();
+    }
+    let length = |cell: &markdown::Text| -> f32 {
+        cell.spans
+            .iter()
+            .map(|s| s.text.chars().count())
+            .sum::<usize>() as f32
+    };
+    let mut weights = vec![0f32; columns];
+    for cells in std::iter::once(head).chain(rows.iter().map(Vec::as_slice)) {
+        for (ix, cell) in cells.iter().enumerate().take(columns) {
+            weights[ix] = weights[ix].max(length(cell));
+        }
+    }
+    // The offset before the square root compresses the short end: two labels
+    // of three and five characters should not differ by a third, while a
+    // paragraph should still be visibly wider than a label.
+    for weight in &mut weights {
+        *weight = (*weight + 8.).sqrt();
+    }
+    let total: f32 = weights.iter().sum();
+    if total <= 0. {
+        return vec![1. / columns as f32; columns];
+    }
+    // No column narrower than roughly half an even share, so a terse column
+    // still has room for its heading.
+    let floor = 0.5 / columns as f32;
+    let mut fractions: Vec<f32> = weights.iter().map(|w| (w / total).max(floor)).collect();
+    let sum: f32 = fractions.iter().sum();
+    for fraction in &mut fractions {
+        *fraction /= sum;
+    }
+    fractions
+}
+
 /// One laid-out run of document text. Pieces are registered in document order
 /// as the page renders, which is what lets a selection run across blocks.
 struct Piece {
@@ -321,6 +401,14 @@ struct Baca {
     /// Which library entry the keyboard is on.
     cursor: usize,
     view: View,
+    /// The outline entry whose section is on screen.
+    active: usize,
+    /// Outline entries whose children are folded away.
+    collapsed: HashSet<usize>,
+    outline_scroll: ScrollHandle,
+    /// Set when the reader crosses into a new section, so the outline can
+    /// scroll that entry into view once.
+    follow_outline: bool,
     collections: Vec<library::Collection>,
     settings: Settings,
     watch: Option<watch::Watch>,
@@ -353,6 +441,10 @@ impl Baca {
             outline: settings.outline,
             cursor: 0,
             view: View::Home,
+            active: 0,
+            collapsed: HashSet::new(),
+            outline_scroll: ScrollHandle::new(),
+            follow_outline: false,
             collections: Vec::new(),
             watch: watch::Watch::new(),
             settings,
@@ -632,6 +724,8 @@ impl Baca {
         self.anchor = None;
         self.head = None;
         self.hit = 0;
+        self.active = 0;
+        self.collapsed.clear();
         self.pieces.borrow_mut().clear();
         self.hits.borrow_mut().clear();
         match resumed {
@@ -791,6 +885,56 @@ impl Baca {
         let delta = bounds.top() - viewport.top() - self.at(size_of::BODY_LINE);
         drop(pieces);
         self.scroll.set_offset(point(at.x, at.y - delta));
+        cx.notify()
+    }
+
+    /// Work out which section the reader is in, from the previous frame's
+    /// layout — this frame's has not been measured yet. Silence rather than a
+    /// guess when there is nothing laid out to go on.
+    fn measure_active_heading(&mut self) {
+        let found = {
+            let pieces = self.pieces.borrow();
+            let headings = self.heading_pieces.borrow();
+            if pieces.is_empty() || headings.is_empty() {
+                None
+            } else {
+                // A heading counts as reached once it passes a line or two
+                // below the top edge, which is where the eye actually is.
+                let top = self.scroll.bounds().top() + self.at(size_of::BODY_LINE) * 2.;
+                let mut active = 0;
+                for (ix, &piece) in headings.iter().enumerate() {
+                    let Some(piece) = pieces.get(piece) else {
+                        continue;
+                    };
+                    if piece.layout.bounds().top() <= top {
+                        active = ix;
+                    } else {
+                        break;
+                    }
+                }
+                Some(active)
+            }
+        };
+        if let Some(active) = found {
+            if active != self.active {
+                self.active = active;
+                self.follow_outline = true;
+            }
+        }
+    }
+
+    fn outline_rows(&self) -> Vec<usize> {
+        visible_outline(&self.doc.outline, &self.collapsed)
+    }
+
+    fn has_children(&self, ix: usize) -> bool {
+        has_children(&self.doc.outline, ix)
+    }
+
+    fn toggle_collapsed(&mut self, ix: usize, cx: &mut gpui::Context<Self>) {
+        if !self.collapsed.remove(&ix) {
+            self.collapsed.insert(ix);
+        }
         cx.notify()
     }
 
@@ -1274,13 +1418,16 @@ impl Baca {
                     .into_any_element()
             }
             Block::Table { aligns, head, rows } => {
+                let widths = column_widths(head, rows);
+                let even = 1. / widths.len().max(1) as f32;
                 let cell = |text: &markdown::Text,
                             ix: usize,
                             cell_id: usize,
                             strong: bool|
                  -> gpui::AnyElement {
                     let mut c = div()
-                        .flex_1()
+                        .w(relative(widths.get(ix).copied().unwrap_or(even)))
+                        .flex_none()
                         .min_w_0()
                         .px_3()
                         .py_2()
@@ -1462,35 +1609,77 @@ impl Baca {
                 .map(|(level, _, _)| *level as usize)
                 .min()
                 .unwrap_or(1);
-            panel =
-                panel.child(
-                    div()
-                        .id("outline")
-                        .flex_1()
-                        .overflow_scroll()
-                        .px_4()
-                        .pt_4()
-                        .pb_6()
-                        .children(self.doc.outline.iter().enumerate().map(
-                            |(ix, (level, text, _))| {
-                                let depth = (*level as usize).saturating_sub(smallest);
+            panel = panel.child(
+                div()
+                    .id("outline")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.outline_scroll)
+                    .px_2()
+                    .pt_4()
+                    .pb_6()
+                    .children(self.outline_rows().into_iter().map(|ix| {
+                        let (level, text, _) = &self.doc.outline[ix];
+                        let depth = (*level as usize).saturating_sub(smallest);
+                        let here = ix == self.active;
+                        let folded = self.collapsed.contains(&ix);
+                        let parent = self.has_children(ix);
+                        div()
+                            .flex()
+                            .items_start()
+                            .pl(px(4. + depth as f32 * 10.))
+                            .when(here, |this| this.bg(p.bg_raised))
+                            // A rule down the left marks where you are far
+                            // more quietly than colouring the whole row.
+                            .border_l_2()
+                            .border_color(if here { p.accent } else { p.bg_subtle })
+                            .child(
+                                div()
+                                    .id(("fold", ix))
+                                    .w(px(16.))
+                                    .flex_none()
+                                    .py_1()
+                                    .font_family(theme::mono())
+                                    .text_size(self.at(size_of::LABEL))
+                                    .text_color(p.text_faint)
+                                    .when(parent, |this| {
+                                        this.cursor_pointer()
+                                            .hover(|h| h.text_color(p.accent))
+                                            .on_click(cx.listener(move |state, _, _, cx| {
+                                                state.toggle_collapsed(ix, cx)
+                                            }))
+                                    })
+                                    .child(match (parent, folded) {
+                                        (true, true) => "▸",
+                                        (true, false) => "▾",
+                                        (false, _) => "",
+                                    }),
+                            )
+                            .child(
                                 div()
                                     .id(("outline", ix))
+                                    .flex_1()
+                                    .min_w_0()
                                     .cursor_pointer()
                                     .py_1()
-                                    .pl(px(8. + depth as f32 * 12.))
                                     .pr_2()
                                     .font_family(theme::body())
                                     .text_size(self.at(size_of::SMALL))
-                                    .text_color(if depth == 0 { p.text } else { p.text_muted })
-                                    .hover(|this| this.bg(p.bg_raised))
+                                    // Top-level entries, and wherever you
+                                    // are, read at full strength.
+                                    .text_color(if here || depth == 0 {
+                                        p.text
+                                    } else {
+                                        p.text_muted
+                                    })
+                                    .hover(|this| this.text_color(p.accent))
                                     .on_click(cx.listener(move |state, _, _, cx| {
                                         state.jump_to_heading(ix, cx)
                                     }))
-                                    .child(text.clone())
-                            },
-                        )),
-                );
+                                    .child(text.clone()),
+                            )
+                    })),
+            );
         } else {
             // On a shelf, or in a document with no headings: say which
             // collection this is and how much is in it.
@@ -2018,6 +2207,15 @@ impl Render for Baca {
         }
         let p = self.theme.palette();
         let this = cx.entity();
+        // Read the last frame's layout before discarding it: it is the only
+        // record of where the headings ended up.
+        self.measure_active_heading();
+        if self.follow_outline {
+            if let Some(row) = self.outline_rows().iter().position(|&ix| ix == self.active) {
+                self.outline_scroll.scroll_to_item(row);
+            }
+            self.follow_outline = false;
+        }
         // These are re-registered from scratch each frame, in document order,
         // so the indices a selection or a search holds stay meaningful.
         self.pieces.borrow_mut().clear();
@@ -2389,6 +2587,131 @@ mod tests {
         let (title, preview) = summarize("", "notes.md");
         assert_eq!(title, "notes.md");
         assert_eq!(preview, "No preview available.");
+    }
+
+    fn cells(texts: &[&str]) -> Vec<markdown::Text> {
+        texts
+            .iter()
+            .map(|t| {
+                markdown::parse(t).blocks.first().map_or_else(
+                    markdown::Text::default,
+                    |b| match b {
+                        markdown::Block::Paragraph(text) => text.clone(),
+                        _ => markdown::Text::default(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn outline_of(levels: &[u32]) -> Vec<Heading> {
+        levels
+            .iter()
+            .enumerate()
+            .map(|(ix, level)| {
+                let level = match level {
+                    1 => HeadingLevel::H1,
+                    2 => HeadingLevel::H2,
+                    3 => HeadingLevel::H3,
+                    _ => HeadingLevel::H4,
+                };
+                (level, format!("h{ix}"), ix.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn folding_a_heading_hides_what_is_nested_under_it() {
+        //  0 #   1 ##   2 ###   3 ###   4 ##   5 #
+        let outline = outline_of(&[1, 2, 3, 3, 2, 1]);
+        let collapsed = HashSet::from([1]);
+        assert_eq!(
+            visible_outline(&outline, &collapsed),
+            vec![0, 1, 4, 5],
+            "the two H3s under the folded H2 go, its sibling and the next H1 stay"
+        );
+    }
+
+    #[test]
+    fn folding_a_top_heading_hides_the_whole_branch() {
+        let outline = outline_of(&[1, 2, 3, 1]);
+        assert_eq!(visible_outline(&outline, &HashSet::from([0])), vec![0, 3]);
+    }
+
+    #[test]
+    fn nothing_folded_shows_everything() {
+        let outline = outline_of(&[1, 2, 3, 2]);
+        assert_eq!(visible_outline(&outline, &HashSet::new()), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn folding_a_leaf_changes_nothing() {
+        let outline = outline_of(&[1, 2, 2]);
+        assert_eq!(
+            visible_outline(&outline, &HashSet::from([2])),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn only_headings_with_something_below_can_fold() {
+        let outline = outline_of(&[1, 2, 2, 1]);
+        assert!(has_children(&outline, 0), "H1 with H2s under it");
+        assert!(!has_children(&outline, 1), "H2 followed by a sibling");
+        assert!(!has_children(&outline, 2), "H2 followed by an H1");
+        assert!(!has_children(&outline, 3), "the last entry");
+        assert!(!has_children(&outline, 99), "out of range");
+    }
+
+    #[test]
+    fn a_terse_column_yields_room_to_a_wordy_one() {
+        let head = cells(&["Feature", "Yes"]);
+        let rows = vec![cells(&[
+            "A long description of what this row is actually about",
+            "no",
+        ])];
+        let widths = column_widths(&head, &rows);
+        assert!(
+            widths[0] > widths[1],
+            "prose column should be wider: {widths:?}"
+        );
+        assert!((widths.iter().sum::<f32>() - 1.).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_narrow_column_keeps_a_readable_minimum() {
+        let head = cells(&["x", "Description"]);
+        let rows = vec![cells(&["1", &"word ".repeat(40)])];
+        let widths = column_widths(&head, &rows);
+        assert!(
+            widths[0] >= 0.2,
+            "one long column must not crush the other: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn identical_columns_are_even() {
+        let head = cells(&["One", "Two", "Six"]);
+        let rows = vec![cells(&["aaa", "bbb", "ccc"])];
+        let widths = column_widths(&head, &rows);
+        for w in &widths {
+            assert!((w - 1. / 3.).abs() < 0.001, "{widths:?}");
+        }
+    }
+
+    #[test]
+    fn a_couple_of_characters_barely_move_a_column() {
+        let head = cells(&["One", "Two", "Three"]);
+        let rows = vec![cells(&["aaa", "bbb", "ccc"])];
+        let widths = column_widths(&head, &rows);
+        for w in &widths {
+            assert!((w - 1. / 3.).abs() < 0.02, "{widths:?}");
+        }
+    }
+
+    #[test]
+    fn a_table_with_no_columns_is_harmless() {
+        assert!(column_widths(&[], &[]).is_empty());
     }
 
     #[test]

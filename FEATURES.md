@@ -70,6 +70,32 @@ from a launch with no arguments.
 - [ ] **Pinned collections** — keep the ones you use at the top.
 - [ ] **Per-collection sort** — by title, by date, by how recently read.
 
+## Fitted to the documents actually being read
+
+A survey of the four documents in use (about 2,490 lines) found front matter
+and tables in every one, code fences in two, and **no** Mermaid, maths,
+wikilinks, images, links or footnotes at all. Their headings run 113 × `###`
+against 22 × `##` and 4 × `#` — long documents, deeply sectioned, table-heavy,
+and standalone rather than interlinked.
+
+That is what these three are for. It is also why Mermaid, maths and backlinks
+are not next: there is nothing yet for them to render.
+
+- [x] **An outline that knows where you are** — scroll-spy highlighting of the
+      section being read, and collapsible groups. With around 28 subsections
+      per document the outline is the main way to navigate, but it is a flat
+      list that gives no sense of position. The active section is measured
+      from the previous frame's layout, since the current frame's has not
+      happened yet.
+- [x] **Real table column widths** — every column is currently `flex_1`, so a
+      column of "yes"/"no" is given the same width as a column of prose. These
+      documents are table-heavy, so the waste shows on nearly every page.
+      Widths come from the square root of the longest cell, offset to keep
+      near-equal columns even, and floored so a terse column keeps its
+      heading.
+- [x] **Look in `~/Downloads`** — where documents actually land, and where
+      these four live. It has to be added by hand today.
+
 ## P2 — Differentiators
 
 - [ ] **Math** — LaTeX / KaTeX-style rendering.

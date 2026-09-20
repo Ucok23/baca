@@ -8,9 +8,11 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Folder names under `$HOME` that usually hold notes.
-const NOTE_HOMES: [&str; 8] = [
+/// Folder names under `$HOME` that usually hold notes. `Downloads` is here
+/// because that is where documents land, whatever anyone intends.
+const NOTE_HOMES: [&str; 9] = [
     "Documents",
+    "Downloads",
     "Notes",
     "notes",
     "Obsidian",
